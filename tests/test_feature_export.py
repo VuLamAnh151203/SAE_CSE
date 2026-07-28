@@ -96,6 +96,31 @@ class FeatureExportTest(unittest.TestCase):
                 self.assertNotIn("feature_embedding", archive.files)
                 self.assertIn("feature_fusion", archive.files)
 
+    def test_all_cosine_export_includes_unimodal_embeddings(self):
+        result = self._result(include_embedding=True)
+        result["text_embeddings_array"] = np.ones(
+            (2, 3), dtype=np.float32
+        )
+        result["audio_embeddings_array"] = np.ones(
+            (2, 3), dtype=np.float32
+        ) * 2
+        result["visual_embeddings_array"] = np.ones(
+            (2, 3), dtype=np.float32
+        ) * 3
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "features_train.npz")
+            save_feature_npz(path, result)
+            with np.load(path) as archive:
+                self.assertEqual(
+                    archive["feature_l_embedding"].shape, (2, 3)
+                )
+                self.assertEqual(
+                    archive["feature_a_embedding"].shape, (2, 3)
+                )
+                self.assertEqual(
+                    archive["feature_v_embedding"].shape, (2, 3)
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

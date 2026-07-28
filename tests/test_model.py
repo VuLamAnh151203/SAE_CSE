@@ -17,7 +17,11 @@ from losses import (  # noqa: E402
     compute_sdt_cse_losses,
     iemocap_class_weights,
 )
-from model import SDTCSEModel  # noqa: E402
+from model import (  # noqa: E402
+    CosineEmotionClassifier,
+    SDTCSEModel,
+    SphericalFusionHead,
+)
 
 
 def make_inputs():
@@ -65,7 +69,12 @@ def make_model(mode):
 class ModelModeTest(unittest.TestCase):
     def test_output_shapes_and_unit_embeddings(self):
         inputs = make_inputs()
-        for mode in ("sdt", "sdt_cosine", "sdt_cse"):
+        for mode in (
+            "sdt",
+            "sdt_cosine",
+            "sdt_cse",
+            "sdt_cse_all_cosine",
+        ):
             model = make_model(mode).eval()
             with torch.no_grad():
                 outputs = model(*inputs)
@@ -88,6 +97,61 @@ class ModelModeTest(unittest.TestCase):
                 self.assertLessEqual(
                     float(model.effective_cosine_scale), 100.0
                 )
+            if mode == "sdt_cse_all_cosine":
+                self.assertIsInstance(
+                    model.t_output_layer, CosineEmotionClassifier
+                )
+                self.assertIsInstance(
+                    model.a_output_layer, CosineEmotionClassifier
+                )
+                self.assertIsInstance(
+                    model.v_output_layer, CosineEmotionClassifier
+                )
+                for projector in (
+                    model.text_projector,
+                    model.audio_projector,
+                    model.visual_projector,
+                ):
+                    self.assertIsInstance(projector, SphericalFusionHead)
+                for output_name in (
+                    "text_embeddings",
+                    "audio_embeddings",
+                    "visual_embeddings",
+                ):
+                    modality_embeddings = outputs[output_name]
+                    self.assertEqual(
+                        modality_embeddings.shape, (2, 4, 6)
+                    )
+                    modality_norms = modality_embeddings.norm(
+                        p=2, dim=-1
+                    )
+                    self.assertTrue(
+                        torch.allclose(
+                            modality_norms,
+                            torch.ones_like(modality_norms),
+                            atol=1e-6,
+                        )
+                    )
+                for scale in (
+                    model.effective_unimodal_cosine_scales.values()
+                ):
+                    self.assertGreaterEqual(float(scale), 1.0)
+                    self.assertLessEqual(float(scale), 100.0)
+            else:
+                self.assertTrue(
+                    all(
+                        scale is None
+                        for scale in (
+                            model.effective_unimodal_cosine_scales.values()
+                        )
+                    )
+                )
+                self.assertIsNone(outputs["text_embeddings"])
+                self.assertIsNone(outputs["audio_embeddings"])
+                self.assertIsNone(outputs["visual_embeddings"])
+                self.assertIsNone(model.text_projector)
+                self.assertIsNone(model.audio_projector)
+                self.assertIsNone(model.visual_projector)
 
     def test_cse_gradients_reach_encoder_and_unimodal_heads(self):
         model = make_model("sdt_cse")
@@ -108,6 +172,38 @@ class ModelModeTest(unittest.TestCase):
         self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
         self.assertIsNotNone(model.cosine_classifier.class_weights.grad)
         self.assertIsNotNone(model.t_output_layer[-1].weight.grad)
+
+    def test_all_cosine_mode_preserves_cse_and_distillation_gradients(self):
+        model = make_model("sdt_cse_all_cosine")
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+        )
+        losses["total_loss"].backward()
+
+        self.assertGreater(float(losses["circular_cse"]), 0.0)
+        self.assertGreaterEqual(float(losses["distillation"]), 0.0)
+        self.assertIsNotNone(model.textf_input.weight.grad)
+        self.assertIsNotNone(model.last_gate.fc.weight.grad)
+        self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
+        self.assertIsNotNone(model.cosine_classifier.class_weights.grad)
+        self.assertIsNotNone(model.cosine_classifier.log_scale.grad)
+        for projector, classifier in (
+            (model.text_projector, model.t_output_layer),
+            (model.audio_projector, model.a_output_layer),
+            (model.visual_projector, model.v_output_layer),
+        ):
+            self.assertIsNotNone(projector.linear_1.weight.grad)
+            self.assertIsNotNone(projector.linear_2.weight.grad)
+            self.assertIsNotNone(classifier.class_weights.grad)
+            self.assertIsNotNone(classifier.log_scale.grad)
 
     def test_cosine_control_has_no_circular_term(self):
         model = make_model("sdt_cosine")

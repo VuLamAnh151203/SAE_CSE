@@ -29,7 +29,7 @@ from losses import (
     compute_sdt_cse_losses,
     iemocap_class_weights,
 )
-from model import EXPERIMENT_MODES, SDTCSEModel
+from model import CIRCULAR_CSE_MODES, EXPERIMENT_MODES, SDTCSEModel
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -177,6 +177,9 @@ def run_epoch(
     visual_features = []
     fusion_features = []
     projected_embeddings = []
+    text_projected_embeddings = []
+    audio_projected_embeddings = []
+    visual_projected_embeddings = []
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
@@ -253,6 +256,22 @@ def run_epoch(
                 projected_embeddings.append(
                     flat_embeddings[valid].detach().cpu().numpy()
                 )
+            for output_name, destination in (
+                ("text_embeddings", text_projected_embeddings),
+                ("audio_embeddings", audio_projected_embeddings),
+                ("visual_embeddings", visual_projected_embeddings),
+            ):
+                modality_embeddings = outputs[output_name]
+                if modality_embeddings is not None:
+                    flat_modality_embeddings = modality_embeddings.reshape(
+                        -1, modality_embeddings.size(-1)
+                    )
+                    destination.append(
+                        flat_modality_embeddings[valid]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
 
             probability_tensor = F.softmax(
                 outputs["fusion_logits"], dim=-1
@@ -305,6 +324,14 @@ def run_epoch(
     result["cosine_scale"] = (
         None if scale is None else float(scale.detach().cpu().item())
     )
+    for modality, modality_scale in (
+        model.effective_unimodal_cosine_scales.items()
+    ):
+        result["{}_cosine_scale".format(modality)] = (
+            None
+            if modality_scale is None
+            else float(modality_scale.detach().cpu().item())
+        )
 
     if collect_outputs:
         result["labels_array"] = labels
@@ -325,6 +352,21 @@ def run_epoch(
         result["embeddings_array"] = (
             np.concatenate(projected_embeddings, axis=0)
             if projected_embeddings
+            else None
+        )
+        result["text_embeddings_array"] = (
+            np.concatenate(text_projected_embeddings, axis=0)
+            if text_projected_embeddings
+            else None
+        )
+        result["audio_embeddings_array"] = (
+            np.concatenate(audio_projected_embeddings, axis=0)
+            if audio_projected_embeddings
+            else None
+        )
+        result["visual_embeddings_array"] = (
+            np.concatenate(visual_projected_embeddings, axis=0)
+            if visual_projected_embeddings
             else None
         )
     return result
@@ -384,6 +426,14 @@ def save_feature_npz(path, result):
         export["feature_embedding"] = np.asarray(
             result["embeddings_array"], dtype=np.float32
         )
+    for export_name, result_name in (
+        ("feature_l_embedding", "text_embeddings_array"),
+        ("feature_a_embedding", "audio_embeddings_array"),
+        ("feature_v_embedding", "visual_embeddings_array"),
+    ):
+        values = result.get(result_name)
+        if values is not None:
+            export[export_name] = np.asarray(values, dtype=np.float32)
     expected_rows = labels.shape[0]
     for name, values in export.items():
         if values.shape[0] != expected_rows:
@@ -403,6 +453,9 @@ def public_metrics(result):
         "macro_f1",
         "macro_recall",
         "cosine_scale",
+        "text_cosine_scale",
+        "audio_cosine_scale",
+        "visual_cosine_scale",
     ]
     return {key: result.get(key) for key in keys}
 
@@ -447,9 +500,9 @@ def is_better_validation(
 
 
 def experiment_directory_name(mode, circular_weight):
-    if mode == "sdt_cse":
-        return "sdt_cse_lambda_{}".format(
-            format(float(circular_weight), "g")
+    if mode in CIRCULAR_CSE_MODES:
+        return "{}_lambda_{}".format(
+            mode, format(float(circular_weight), "g")
         )
     return mode
 
@@ -516,7 +569,7 @@ def validate_arguments(args):
             raise ValueError("--{} must be nonnegative".format(
                 name.replace("_", "-")
             ))
-    if args.experiment_mode != "sdt_cse":
+    if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
 
 
@@ -571,7 +624,7 @@ def train_and_test(args):
         CircularCSELoss(
             same_class_margin=args.same_class_margin
         ).to(device)
-        if args.experiment_mode == "sdt_cse"
+        if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
     )
     optimizer = optim.Adam(
@@ -725,6 +778,13 @@ def train_and_test(args):
     }
     if testing["embeddings_array"] is not None:
         archive["embeddings"] = testing["embeddings_array"]
+    for archive_name, result_name in (
+        ("text_embeddings", "text_embeddings_array"),
+        ("audio_embeddings", "audio_embeddings_array"),
+        ("visual_embeddings", "visual_embeddings_array"),
+    ):
+        if testing[result_name] is not None:
+            archive[archive_name] = testing[result_name]
     np.savez_compressed(
         os.path.join(run_dir, "test_representations.npz"),
         **archive
@@ -745,6 +805,21 @@ def train_and_test(args):
             testing["embeddings_array"],
             testing["labels_array"],
         )
+    unimodal_projected_geometry = {}
+    for representation_name, result_name in (
+        ("text_embeddings", "text_embeddings_array"),
+        ("audio_embeddings", "audio_embeddings_array"),
+        ("visual_embeddings", "visual_embeddings_array"),
+    ):
+        if testing[result_name] is not None:
+            unimodal_projected_geometry[representation_name] = (
+                save_geometry_artifacts(
+                    geometry_dir,
+                    representation_name,
+                    testing[result_name],
+                    testing["labels_array"],
+                )
+            )
     summary = {
         "experiment_mode": args.experiment_mode,
         "seed": args.seed,
@@ -755,6 +830,7 @@ def train_and_test(args):
         "test": public_metrics(testing),
         "fusion_geometry": fusion_geometry,
         "projected_geometry": projected_geometry,
+        "unimodal_projected_geometry": unimodal_projected_geometry,
         "run_directory": run_dir,
     }
     write_json(os.path.join(run_dir, "summary.json"), summary)
@@ -765,7 +841,7 @@ def train_and_test(args):
 def build_argument_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Train SDT, SDT-cosine, or SDT-CSE with a fixed "
+            "Train SDT and cosine/CircularCSE variants with a fixed "
             "train/validation/test split."
         )
     )

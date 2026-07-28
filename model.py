@@ -5,7 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-EXPERIMENT_MODES = ("sdt", "sdt_cosine", "sdt_cse")
+EXPERIMENT_MODES = (
+    "sdt",
+    "sdt_cosine",
+    "sdt_cse",
+    "sdt_cse_all_cosine",
+)
+CIRCULAR_CSE_MODES = ("sdt_cse", "sdt_cse_all_cosine")
 
 
 def gelu(x):
@@ -330,21 +336,56 @@ class SDTCSEModel(nn.Module):
         self.features_reduce_v = nn.Linear(3 * hidden_dim, hidden_dim)
         self.last_gate = MultimodalGatedFusion(hidden_dim)
 
-        self.t_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes),
-        )
-        self.a_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes),
-        )
-        self.v_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes),
-        )
+        self.text_projector = None
+        self.audio_projector = None
+        self.visual_projector = None
+        if experiment_mode == "sdt_cse_all_cosine":
+            self.text_projector = SphericalFusionHead(
+                hidden_dim,
+                embedding_dim=embedding_dim,
+                dropout=projection_dropout,
+            )
+            self.audio_projector = SphericalFusionHead(
+                hidden_dim,
+                embedding_dim=embedding_dim,
+                dropout=projection_dropout,
+            )
+            self.visual_projector = SphericalFusionHead(
+                hidden_dim,
+                embedding_dim=embedding_dim,
+                dropout=projection_dropout,
+            )
+            self.t_output_layer = CosineEmotionClassifier(
+                embedding_dim,
+                num_classes=n_classes,
+                initial_scale=initial_cosine_scale,
+            )
+            self.a_output_layer = CosineEmotionClassifier(
+                embedding_dim,
+                num_classes=n_classes,
+                initial_scale=initial_cosine_scale,
+            )
+            self.v_output_layer = CosineEmotionClassifier(
+                embedding_dim,
+                num_classes=n_classes,
+                initial_scale=initial_cosine_scale,
+            )
+        else:
+            self.t_output_layer = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, n_classes),
+            )
+            self.a_output_layer = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, n_classes),
+            )
+            self.v_output_layer = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, n_classes),
+            )
 
         self.all_output_layer = None
         self.fusion_projector = None
@@ -505,16 +546,34 @@ class SDTCSEModel(nn.Module):
             embeddings = self.fusion_projector(fusion_features)
             fusion_logits = self.cosine_classifier(embeddings)
 
+        text_embeddings = None
+        audio_embeddings = None
+        visual_embeddings = None
+        if self.experiment_mode == "sdt_cse_all_cosine":
+            text_embeddings = self.text_projector(text_hidden)
+            audio_embeddings = self.audio_projector(audio_hidden)
+            visual_embeddings = self.visual_projector(visual_hidden)
+            text_logits = self.t_output_layer(text_embeddings)
+            audio_logits = self.a_output_layer(audio_embeddings)
+            visual_logits = self.v_output_layer(visual_embeddings)
+        else:
+            text_logits = self.t_output_layer(text_hidden)
+            audio_logits = self.a_output_layer(audio_hidden)
+            visual_logits = self.v_output_layer(visual_hidden)
+
         return {
             "text_representation": text_hidden,
             "audio_representation": audio_hidden,
             "visual_representation": visual_hidden,
             "fusion_features": fusion_features,
             "embeddings": embeddings,
+            "text_embeddings": text_embeddings,
+            "audio_embeddings": audio_embeddings,
+            "visual_embeddings": visual_embeddings,
             "fusion_logits": fusion_logits,
-            "text_logits": self.t_output_layer(text_hidden),
-            "audio_logits": self.a_output_layer(audio_hidden),
-            "visual_logits": self.v_output_layer(visual_hidden),
+            "text_logits": text_logits,
+            "audio_logits": audio_logits,
+            "visual_logits": visual_logits,
         }
 
     @property
@@ -522,3 +581,17 @@ class SDTCSEModel(nn.Module):
         if self.cosine_classifier is None:
             return None
         return self.cosine_classifier.effective_scale
+
+    @property
+    def effective_unimodal_cosine_scales(self):
+        if self.experiment_mode != "sdt_cse_all_cosine":
+            return {
+                "text": None,
+                "audio": None,
+                "visual": None,
+            }
+        return {
+            "text": self.t_output_layer.effective_scale,
+            "audio": self.a_output_layer.effective_scale,
+            "visual": self.v_output_layer.effective_scale,
+        }

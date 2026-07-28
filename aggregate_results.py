@@ -32,9 +32,9 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse":
-        return "sdt_cse_lambda_{}".format(
-            format(float(summary["circular_weight"]), "g")
+    if mode in ("sdt_cse", "sdt_cse_all_cosine"):
+        return "{}_lambda_{}".format(
+            mode, format(float(summary["circular_weight"]), "g")
         )
     return mode
 
@@ -156,4 +156,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

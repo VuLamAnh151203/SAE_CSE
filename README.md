@@ -1,28 +1,40 @@
 # SDT-CSE
 
 SDT-CSE preserves SDT's multimodal encoder, hierarchical gated fusion,
-unimodal emotion classifiers, hard-label supervision, and KL
-self-distillation. It adds an optional normalized projection of the fused
-representation, a cosine emotion classifier, and CircularCSE.
+hard-label supervision, and KL self-distillation. It adds optional cosine
+emotion classifiers and CircularCSE.
 
 The existing `../SDT` implementation and data are not modified.
 
 ## Experiment modes
 
-| Mode | Fusion classifier | Self-distillation | CircularCSE |
-|---|---|---:|---:|
-| `sdt` | Original linear classifier | Yes | No |
-| `sdt_cosine` | Spherical projection + cosine classifier | Yes | No |
-| `sdt_cse` | Spherical projection + cosine classifier | Yes | Yes |
+| Mode | Fusion classifier | Unimodal classifiers | Self-distillation | CircularCSE |
+|---|---|---|---:|---:|
+| `sdt` | Original linear | Original linear | Yes | No |
+| `sdt_cosine` | Spherical projection + cosine | Original linear | Yes | No |
+| `sdt_cse` | Spherical projection + cosine | Original linear | Yes | Yes |
+| `sdt_cse_all_cosine` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Yes |
 
-All modes use the same text, audio, and visual classifiers. The fused
-classifier remains the teacher for all three unimodal branches.
+In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
+representation is processed by an independent head with the same structure
+as the fusion head:
+
+```text
+Linear(H,H) -> GELU -> Dropout -> Linear(H,embedding_dim)
+-> L2 normalize -> cosine classifier
+```
+
+The four heads have independent projection parameters, normalized class
+weights, and learnable scales. The fused classifier remains the
+self-distillation teacher for all three branches in every mode.
 
 The comparisons have distinct purposes:
 
 - `sdt_cosine - sdt` measures the effect of replacing the linear head.
 - `sdt_cse - sdt_cosine` isolates CircularCSE.
 - `sdt_cse - sdt` measures the complete proposed model change.
+- `sdt_cse_all_cosine - sdt_cse` isolates replacing the three original
+  unimodal classifiers with cosine classifiers.
 
 ## Data split
 
@@ -62,7 +74,7 @@ terms use temperature-scaled fused teacher probabilities and unimodal student
 log-probabilities. They are not multiplied by temperature squared, and the
 teacher is not detached, matching the repository implementation.
 
-For `sdt_cse`, the complete objective is:
+For `sdt_cse` and `sdt_cse_all_cosine`, the complete objective is:
 
 ```text
 SDT objective + circular_weight * CircularCSE
@@ -113,9 +125,10 @@ Run the corresponding controls:
 ```bash
 python train.py --experiment-mode sdt --seed 2024
 python train.py --experiment-mode sdt_cosine --seed 2024
+python train.py --experiment-mode sdt_cse_all_cosine --seed 2024
 ```
 
-Run all three modes over ten initialization seeds and aggregate them:
+Run all four modes over ten initialization seeds and aggregate them:
 
 ```bash
 bash exec_iemocap.sh
@@ -169,8 +182,13 @@ feature_a
 feature_fusion
 ```
 
-Cosine and CircularCSE modes also add `feature_embedding`, containing the
-normalized projection used by their cosine classifier and by CircularCSE.
+All non-`sdt` modes also add `feature_embedding`, containing the normalized
+fusion projection used by their fusion cosine classifier and, in the two
+CircularCSE modes, by CircularCSE.
+`sdt_cse_all_cosine` additionally stores `feature_l_embedding`,
+`feature_a_embedding`, and `feature_v_embedding`, which are the normalized
+text, audio, and visual projections used by their respective cosine
+classifiers.
 `feature_l`, `feature_v`, and `feature_a` are SDT's final text-, visual-, and
 audio-oriented representations immediately before their unimodal
 classifiers. `feature_fusion` is the final hierarchical gated fusion
