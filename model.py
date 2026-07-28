@@ -11,13 +11,132 @@ EXPERIMENT_MODES = (
     "sdt_cse",
     "sdt_cse_all_cosine",
     "sdt_cse_fusion_only",
+    "sdt_cse_learnable_angles",
 )
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
     "sdt_cse_all_cosine",
     "sdt_cse_fusion_only",
+    "sdt_cse_learnable_angles",
 )
 FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
+LEARNABLE_ANGLE_MODES = ("sdt_cse_learnable_angles",)
+CIRCLE_ORDER = (0, 4, 3, 5, 1, 2)
+
+
+class LearnableCircularAngles(nn.Module):
+    """Order-preserving circular angles initialized from a fixed prior."""
+
+    def __init__(
+        self,
+        num_classes=6,
+        prior_angles=None,
+        circle_order=CIRCLE_ORDER,
+    ):
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError("num_classes must be at least 2")
+        if len(circle_order) != num_classes:
+            raise ValueError(
+                "circle_order length must equal num_classes"
+            )
+        if sorted(int(index) for index in circle_order) != list(
+            range(num_classes)
+        ):
+            raise ValueError(
+                "circle_order must be a permutation of class IDs"
+            )
+
+        order = torch.tensor(circle_order, dtype=torch.long)
+        inverse_order = torch.argsort(order)
+        if prior_angles is None:
+            ordered_prior = (
+                torch.arange(num_classes, dtype=torch.float32)
+                * (2.0 * math.pi / num_classes)
+            )
+            prior_angles = ordered_prior[inverse_order]
+        else:
+            prior_angles = torch.as_tensor(
+                prior_angles, dtype=torch.float32
+            ).detach().clone()
+        if prior_angles.shape != (num_classes,):
+            raise ValueError(
+                "prior_angles must have shape [num_classes]"
+            )
+        if not torch.isfinite(prior_angles).all():
+            raise ValueError(
+                "prior_angles must contain only finite values"
+            )
+
+        two_pi = prior_angles.new_tensor(2.0 * math.pi)
+        anchor_label = int(order[0])
+        anchored_prior = torch.remainder(
+            prior_angles - prior_angles[anchor_label],
+            two_pi,
+        )
+        ordered_prior = anchored_prior[order]
+        if not torch.isclose(
+            ordered_prior[0],
+            ordered_prior.new_zeros(()),
+            atol=1e-6,
+        ):
+            raise ValueError("the first circle class must anchor at zero")
+        prior_gaps = torch.cat(
+            (
+                ordered_prior[1:] - ordered_prior[:-1],
+                two_pi.unsqueeze(0) - ordered_prior[-1:],
+            )
+        )
+        if torch.any(prior_gaps <= 0):
+            raise ValueError(
+                "prior angles do not follow the configured circle order"
+            )
+
+        raw_gaps = prior_gaps + torch.log(
+            -torch.expm1(-prior_gaps)
+        )
+        self.num_classes = int(num_classes)
+        self.register_buffer("circle_order", order)
+        self.register_buffer("inverse_circle_order", inverse_order)
+        self.register_buffer("prior_angles", anchored_prior)
+        self.register_buffer("prior_gaps", prior_gaps)
+        self.raw_gaps = nn.Parameter(raw_gaps)
+
+    def normalized_gaps(self):
+        positive_gaps = F.softplus(self.raw_gaps)
+        return (
+            2.0
+            * math.pi
+            * positive_gaps
+            / positive_gaps.sum()
+        )
+
+    def forward(self):
+        gaps = self.normalized_gaps()
+        ordered_angles = torch.cat(
+            (
+                gaps.new_zeros(1),
+                torch.cumsum(gaps[:-1], dim=0),
+            )
+        )
+        return ordered_angles[self.inverse_circle_order]
+
+    def angle_offsets(self, angles=None):
+        if angles is None:
+            angles = self()
+        return angles - self.prior_angles
+
+    def regularization(self, angles=None):
+        return self.angle_offsets(angles).pow(2).sum()
+
+    def geometry(self):
+        angles = self()
+        return {
+            "angles": angles,
+            "gaps": self.normalized_gaps(),
+            "offsets": self.angle_offsets(angles),
+            "regularization": self.regularization(angles),
+        }
 
 
 def gelu(x):
@@ -267,6 +386,7 @@ class SDTCSEModel(nn.Module):
         embedding_dim=256,
         projection_dropout=0.1,
         initial_cosine_scale=16.0,
+        initial_class_angles=None,
     ):
         super().__init__()
         if experiment_mode not in EXPERIMENT_MODES:
@@ -281,6 +401,13 @@ class SDTCSEModel(nn.Module):
         self.n_speakers = n_speakers
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
+        self.circular_angle_learner = None
+        if experiment_mode in LEARNABLE_ANGLE_MODES:
+            self.circular_angle_learner = LearnableCircularAngles(
+                num_classes=n_classes,
+                prior_angles=initial_class_angles,
+                circle_order=CIRCLE_ORDER,
+            )
         padding_idx = n_speakers
 
         self.speaker_embeddings = nn.Embedding(
@@ -575,6 +702,11 @@ class SDTCSEModel(nn.Module):
             audio_logits = self.a_output_layer(audio_hidden)
             visual_logits = self.v_output_layer(visual_hidden)
 
+        angle_state = (
+            self.circular_angle_learner.geometry()
+            if self.circular_angle_learner is not None
+            else None
+        )
         return {
             "text_representation": text_hidden,
             "audio_representation": audio_hidden,
@@ -588,7 +720,26 @@ class SDTCSEModel(nn.Module):
             "text_logits": text_logits,
             "audio_logits": audio_logits,
             "visual_logits": visual_logits,
+            "class_angles": (
+                None if angle_state is None else angle_state["angles"]
+            ),
+            "angle_gaps": (
+                None if angle_state is None else angle_state["gaps"]
+            ),
+            "angle_offsets": (
+                None if angle_state is None else angle_state["offsets"]
+            ),
+            "angle_regularization": (
+                None
+                if angle_state is None
+                else angle_state["regularization"]
+            ),
         }
+
+    def current_circular_angle_state(self):
+        if self.circular_angle_learner is None:
+            return None
+        return self.circular_angle_learner.geometry()
 
     @property
     def effective_cosine_scale(self):

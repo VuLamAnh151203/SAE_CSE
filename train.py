@@ -32,9 +32,11 @@ from losses import (
     iemocap_class_weights,
 )
 from model import (
+    CIRCLE_ORDER,
     CIRCULAR_CSE_MODES,
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
+    LEARNABLE_ANGLE_MODES,
     SDTCSEModel,
 )
 
@@ -55,6 +57,7 @@ LOSS_NAMES = (
     "visual_kl",
     "distillation",
     "circular_cse",
+    "angle_regularization",
 )
 
 
@@ -205,6 +208,7 @@ def run_epoch(
                 unimodal_ce_weight=args.unimodal_ce_weight,
                 distillation_weight=args.distillation_weight,
                 circular_weight=args.circular_weight,
+                angle_weight=args.angle_weight,
             )
             if training:
                 losses["total_loss"].backward()
@@ -510,7 +514,15 @@ def experiment_directory_name(
     mode,
     circular_weight,
     circular_geometry="equal",
+    angle_weight=0.0,
 ):
+    if mode in LEARNABLE_ANGLE_MODES:
+        return "{}_{}_lambda_{}_angle_{}".format(
+            mode,
+            circular_geometry,
+            format(float(circular_weight), "g"),
+            format(float(angle_weight), "g"),
+        )
     if mode in CIRCULAR_CSE_MODES:
         geometry_suffix = (
             "" if circular_geometry == "equal"
@@ -522,6 +534,140 @@ def experiment_directory_name(
             format(float(circular_weight), "g"),
         )
     return mode
+
+
+def current_angle_state(model, fixed_class_angles):
+    learnable_state = model.current_circular_angle_state()
+    if learnable_state is None:
+        return {
+            "learnable": False,
+            "prior_angles": fixed_class_angles,
+            "angles": fixed_class_angles,
+            "gaps": None,
+            "offsets": torch.zeros_like(fixed_class_angles),
+            "regularization": fixed_class_angles.sum() * 0.0,
+            "raw_gaps": None,
+            "circle_order": torch.tensor(
+                CIRCLE_ORDER,
+                device=fixed_class_angles.device,
+                dtype=torch.long,
+            ),
+        }
+    learner = model.circular_angle_learner
+    return {
+        "learnable": True,
+        "prior_angles": learner.prior_angles,
+        "angles": learnable_state["angles"],
+        "gaps": learnable_state["gaps"],
+        "offsets": learnable_state["offsets"],
+        "regularization": learnable_state["regularization"],
+        "raw_gaps": learner.raw_gaps,
+        "circle_order": learner.circle_order,
+    }
+
+
+def angle_state_payload(model, fixed_class_angles):
+    state = current_angle_state(model, fixed_class_angles)
+
+    def values(tensor):
+        if tensor is None:
+            return None
+        return tensor.detach().cpu().tolist()
+
+    def degrees(tensor):
+        if tensor is None:
+            return None
+        return (
+            tensor.detach().cpu() * (180.0 / np.pi)
+        ).tolist()
+
+    angles = state["angles"]
+    return {
+        "learnable": state["learnable"],
+        "circle_order": values(state["circle_order"]),
+        "prior_angles_radians": values(state["prior_angles"]),
+        "prior_angles_degrees": degrees(state["prior_angles"]),
+        "class_angles_radians": values(angles),
+        "class_angles_degrees": degrees(angles),
+        "angle_offsets_radians": values(state["offsets"]),
+        "angle_offsets_degrees": degrees(state["offsets"]),
+        "normalized_gaps_radians": values(state["gaps"]),
+        "normalized_gaps_degrees": degrees(state["gaps"]),
+        "raw_gaps": values(state["raw_gaps"]),
+        "angle_regularization": float(
+            state["regularization"].detach().cpu().item()
+        ),
+        "target_similarity": values(
+            build_target_similarity(angles)
+        ),
+    }
+
+
+def angle_history_row(epoch, model, fixed_class_angles):
+    state = current_angle_state(model, fixed_class_angles)
+    if not state["learnable"]:
+        return None
+    angles = (
+        state["angles"].detach().cpu().numpy()
+        * (180.0 / np.pi)
+    )
+    gaps = (
+        state["gaps"].detach().cpu().numpy()
+        * (180.0 / np.pi)
+    )
+    row = {
+        "epoch": int(epoch),
+        "angle_regularization": float(
+            state["regularization"].detach().cpu().item()
+        ),
+    }
+    for class_id, emotion in ID2EMOTION.items():
+        row["angle_{}_degrees".format(emotion)] = float(
+            angles[class_id]
+        )
+    order = state["circle_order"].detach().cpu().tolist()
+    for position, class_id in enumerate(order):
+        source = ID2EMOTION[int(class_id)]
+        target = ID2EMOTION[int(order[(position + 1) % len(order)])]
+        row["gap_{}_to_{}_degrees".format(source, target)] = float(
+            gaps[position]
+        )
+    return row
+
+
+def build_optimizer(model, learning_rate, weight_decay):
+    if model.circular_angle_learner is None:
+        return optim.Adam(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+    angle_parameters = list(
+        model.circular_angle_learner.parameters()
+    )
+    angle_parameter_ids = {
+        id(parameter) for parameter in angle_parameters
+    }
+    base_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in angle_parameter_ids
+    ]
+    return optim.Adam(
+        [
+            {
+                "params": base_parameters,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": angle_parameters,
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=learning_rate,
+        weight_decay=0.0,
+    )
 
 
 def save_checkpoint(
@@ -540,6 +686,11 @@ def save_checkpoint(
             args.vad_center_arousal,
         ),
     )
+    angle_payload = angle_state_payload(model, angles)
+    selected_angles = torch.tensor(
+        angle_payload["class_angles_radians"],
+        dtype=angles.dtype,
+    )
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -551,8 +702,21 @@ def save_checkpoint(
             args.vad_center_arousal,
         ],
         "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
-        "class_angles": angles.tolist(),
-        "target_similarity": build_target_similarity(angles).tolist(),
+        "angle_weight": args.angle_weight,
+        "circle_order": angle_payload["circle_order"],
+        "prior_class_angles": angle_payload[
+            "prior_angles_radians"
+        ],
+        "class_angles": angle_payload["class_angles_radians"],
+        "angle_gaps": angle_payload["normalized_gaps_radians"],
+        "angle_offsets": angle_payload["angle_offsets_radians"],
+        "raw_gaps": angle_payload["raw_gaps"],
+        "angle_regularization": angle_payload[
+            "angle_regularization"
+        ],
+        "target_similarity": build_target_similarity(
+            selected_angles
+        ).tolist(),
         "class_weights": iemocap_class_weights().tolist(),
         "split_ids": split_ids,
         "selected_epoch": epoch,
@@ -592,6 +756,7 @@ def validate_arguments(args):
         "unimodal_ce_weight",
         "distillation_weight",
         "circular_weight",
+        "angle_weight",
         "same_class_margin",
     ):
         if getattr(args, name) < 0:
@@ -602,6 +767,12 @@ def validate_arguments(args):
         raise ValueError("--vad-center-valence must be finite")
     if not np.isfinite(args.vad_center_arousal):
         raise ValueError("--vad-center-arousal must be finite")
+    if args.circular_geometry is None:
+        args.circular_geometry = (
+            "nrc_vad"
+            if args.experiment_mode in LEARNABLE_ANGLE_MODES
+            else "equal"
+        )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
         args.circular_geometry = "equal"
@@ -615,6 +786,8 @@ def validate_arguments(args):
     if args.experiment_mode in FUSION_ONLY_MODES:
         args.unimodal_ce_weight = 0.0
         args.distillation_weight = 0.0
+    if args.experiment_mode not in LEARNABLE_ANGLE_MODES:
+        args.angle_weight = 0.0
 
 
 def train_and_test(args):
@@ -635,6 +808,7 @@ def train_and_test(args):
             args.experiment_mode,
             args.circular_weight,
             args.circular_geometry,
+            args.angle_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -651,6 +825,14 @@ def train_and_test(args):
         loaders["split_ids"],
     )
 
+    prior_class_angles = build_iemocap_angles(
+        device=device,
+        geometry=args.circular_geometry,
+        vad_center=(
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ),
+    )
     model = SDTCSEModel(
         d_text=args.text_dim,
         d_visual=args.visual_dim,
@@ -664,48 +846,36 @@ def train_and_test(args):
         embedding_dim=args.embedding_dim,
         projection_dropout=args.projection_dropout,
         initial_cosine_scale=args.initial_cosine_scale,
+        initial_class_angles=prior_class_angles,
     ).to(device)
     class_weights = iemocap_class_weights(device=device)
-    class_angles = build_iemocap_angles(
-        device=device,
-        geometry=args.circular_geometry,
-        vad_center=(
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ),
+    initial_angle_payload = angle_state_payload(
+        model, prior_class_angles
     )
     write_json(
         os.path.join(run_dir, "circular_geometry.json"),
         {
             "geometry": args.circular_geometry,
+            "angle_weight": args.angle_weight,
             "vad_center": [
                 args.vad_center_valence,
                 args.vad_center_arousal,
             ],
             "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
-            "class_angles_radians": (
-                class_angles.detach().cpu().tolist()
-            ),
-            "class_angles_degrees": (
-                class_angles.detach().cpu()
-                * (180.0 / np.pi)
-            ).tolist(),
-            "target_similarity": build_target_similarity(
-                class_angles
-            ).detach().cpu().tolist(),
+            **initial_angle_payload,
         },
     )
     circular_loss_function = (
         CircularCSELoss(
-            class_angles=class_angles,
+            class_angles=prior_class_angles,
             same_class_margin=args.same_class_margin,
         ).to(device)
         if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
     )
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.lr,
+    optimizer = build_optimizer(
+        model,
+        learning_rate=args.lr,
         weight_decay=args.weight_decay,
     )
 
@@ -715,6 +885,7 @@ def train_and_test(args):
     best_epoch = None
     best_validation = None
     epoch_rows = []
+    angle_history_rows = []
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
@@ -747,6 +918,15 @@ def train_and_test(args):
             os.path.join(run_dir, "epoch_metrics.csv"),
             epoch_rows,
         )
+        current_history = angle_history_row(
+            epoch, model, prior_class_angles
+        )
+        if current_history is not None:
+            angle_history_rows.append(current_history)
+            write_rows(
+                os.path.join(run_dir, "angle_history.csv"),
+                angle_history_rows,
+            )
         print(
             "epoch={} train_total={:.6f} train_wf1={:.4f} "
             "valid_total={:.6f} valid_wf1={:.4f}".format(
@@ -780,6 +960,31 @@ def train_and_test(args):
 
     checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    selected_angle_payload = angle_state_payload(
+        model, prior_class_angles
+    )
+    selected_class_angles = current_angle_state(
+        model, prior_class_angles
+    )["angles"].detach()
+    if model.circular_angle_learner is not None:
+        write_json(
+            os.path.join(
+                run_dir, "learned_circular_geometry.json"
+            ),
+            {
+                "selected_epoch": best_epoch,
+                "geometry": args.circular_geometry,
+                "angle_weight": args.angle_weight,
+                "vad_center": [
+                    args.vad_center_valence,
+                    args.vad_center_arousal,
+                ],
+                "nrc_vad_anchors": (
+                    build_iemocap_vad_anchors().tolist()
+                ),
+                **selected_angle_payload,
+            },
+        )
     with torch.no_grad():
         selected_training = run_epoch(
             model,
@@ -872,7 +1077,7 @@ def train_and_test(args):
         "fusion_features",
         testing["fusion_features_array"],
         testing["labels_array"],
-        class_angles=class_angles,
+        class_angles=selected_class_angles,
     )
     projected_geometry = None
     if testing["embeddings_array"] is not None:
@@ -881,7 +1086,7 @@ def train_and_test(args):
             "embeddings",
             testing["embeddings_array"],
             testing["labels_array"],
-            class_angles=class_angles,
+            class_angles=selected_class_angles,
         )
     unimodal_projected_geometry = {}
     for representation_name, result_name in (
@@ -896,19 +1101,37 @@ def train_and_test(args):
                     representation_name,
                     testing[result_name],
                     testing["labels_array"],
-                    class_angles=class_angles,
+                    class_angles=selected_class_angles,
                 )
             )
     summary = {
         "experiment_mode": args.experiment_mode,
         "seed": args.seed,
         "circular_weight": args.circular_weight,
+        "angle_weight": args.angle_weight,
         "circular_geometry": args.circular_geometry,
         "vad_center": [
             args.vad_center_valence,
             args.vad_center_arousal,
         ],
-        "class_angles": class_angles.detach().cpu().tolist(),
+        "prior_class_angles": selected_angle_payload[
+            "prior_angles_radians"
+        ],
+        "class_angles": selected_angle_payload[
+            "class_angles_radians"
+        ],
+        "angle_gaps": selected_angle_payload[
+            "normalized_gaps_radians"
+        ],
+        "angle_offsets": selected_angle_payload[
+            "angle_offsets_radians"
+        ],
+        "angle_regularization": selected_angle_payload[
+            "angle_regularization"
+        ],
+        "target_similarity": selected_angle_payload[
+            "target_similarity"
+        ],
         "selected_epoch": best_epoch,
         "training": training_metrics,
         "validation": validation_metrics,
@@ -961,15 +1184,26 @@ def build_argument_parser():
         "--circular-weight", type=float, default=0.1
     )
     parser.add_argument(
+        "--angle-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "prior regularization weight for learnable circular "
+            "angles (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--same-class-margin", type=float, default=0.0
     )
     parser.add_argument(
         "--circular-geometry",
         choices=CIRCULAR_GEOMETRIES,
-        default="equal",
+        default=None,
         help=(
             "equal uses the original six equally spaced angles; "
-            "nrc_vad derives nonuniform angles from NRC-VAD anchors"
+            "nrc_vad derives nonuniform angles from NRC-VAD anchors. "
+            "Defaults to nrc_vad for sdt_cse_learnable_angles and "
+            "equal for all other modes"
         ),
     )
     parser.add_argument(

@@ -14,6 +14,7 @@ METRICS = (
     "macro_recall",
     "fusion_ce",
     "circular_cse",
+    "angle_regularization",
 )
 
 
@@ -32,6 +33,14 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
+    if mode == "sdt_cse_learnable_angles":
+        geometry = summary.get("circular_geometry", "nrc_vad")
+        return "{}_{}_lambda_{}_angle_{}".format(
+            mode,
+            geometry,
+            format(float(summary["circular_weight"]), "g"),
+            format(float(summary.get("angle_weight", 0.1)), "g"),
+        )
     if mode in (
         "sdt_cse",
         "sdt_cse_all_cosine",

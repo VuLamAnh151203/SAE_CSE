@@ -15,6 +15,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse` | Spherical projection + cosine | Original linear | Yes | Yes |
 | `sdt_cse_all_cosine` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Yes |
 | `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
+| `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -38,6 +39,8 @@ The comparisons have distinct purposes:
   unimodal classifiers with cosine classifiers.
 - `sdt_cse_fusion_only - sdt_cse` measures the contribution of the three
   unimodal CE losses and self-distillation branches.
+- `sdt_cse_learnable_angles - sdt_cse` isolates learning ordered class
+  angles while preserving the complete standard SDT-CSE architecture.
 
 ## Data split
 
@@ -92,6 +95,14 @@ fusion CE + circular_weight * CircularCSE
 
 Consequently, all logged unimodal CE and KL components are exactly zero.
 
+For `sdt_cse_learnable_angles`, the complete objective is:
+
+```text
+SDT objective
++ circular_weight * CircularCSE(learned angles)
++ angle_weight * sum((learned angle - prior angle)^2)
+```
+
 The emotion order is:
 
 ```text
@@ -113,10 +124,12 @@ excluded.
 `--circular-geometry` selects the target angles independently of the model
 architecture:
 
-- `equal` is the original equally spaced six-emotion circle and remains the
-  default.
+- `equal` is the original equally spaced six-emotion circle.
 - `nrc_vad` derives non-equally spaced angles from fixed NRC-VAD valence and
   arousal anchors around a configurable affect-space center.
+
+Fixed-angle modes default to `equal`. The learnable-angle mode defaults to
+`nrc_vad`; either prior can be selected explicitly.
 
 The nonuniform version uses:
 
@@ -141,6 +154,27 @@ center. Configuration is rejected if a custom center exactly coincides with
 any anchor, because `atan2(0, 0)` has no meaningful affective direction.
 The selected angles and complete `6 x 6` target matrix are stored in every
 checkpoint and in `circular_geometry.json`.
+
+### Prior-regularized learnable angles
+
+`sdt_cse_learnable_angles` fixes happy at zero and learns six positive gaps
+in this immutable order:
+
+```text
+happy -> excited -> angry -> frustrated -> sad -> neutral -> happy
+```
+
+The gaps are parameterized and normalized as:
+
+```text
+g = softplus(raw_gaps)
+normalized_gaps = 2*pi*g/sum(g)
+```
+
+This guarantees positive gaps, a total circumference of `2*pi`, and stable
+class ordering. The selected prior initializes the gaps and penalizes angle
+displacement. `raw_gaps` uses the normal learning rate but zero optimizer
+weight decay.
 
 ## Commands
 
@@ -176,6 +210,25 @@ This writes to:
 results/sdt_cse_nrc_vad_lambda_0.1/seed_2024/
 ```
 
+Run the prior-regularized learnable-angle version:
+
+```bash
+python train.py \
+  --experiment-mode sdt_cse_learnable_angles \
+  --circular-geometry nrc_vad \
+  --circular-weight 0.1 \
+  --angle-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
+This writes to:
+
+```text
+results/sdt_cse_learnable_angles_nrc_vad_lambda_0.1_angle_0.1/seed_2024/
+```
+
 Select another visible GPU by changing `--gpu-id`, for example:
 
 ```bash
@@ -193,9 +246,10 @@ python train.py --experiment-mode sdt --seed 2024
 python train.py --experiment-mode sdt_cosine --seed 2024
 python train.py --experiment-mode sdt_cse_all_cosine --seed 2024
 python train.py --experiment-mode sdt_cse_fusion_only --seed 2024
+python train.py --experiment-mode sdt_cse_learnable_angles --seed 2024
 ```
 
-Run all five modes over ten initialization seeds and aggregate them:
+Run all six modes over ten initialization seeds and aggregate them:
 
 ```bash
 bash exec_iemocap.sh
@@ -212,6 +266,16 @@ Run the predefined CircularCSE sensitivity analysis:
 ```bash
 bash exec_iemocap_sweep.sh
 ```
+
+Run the learnable-angle prior-weight sensitivity analysis:
+
+```bash
+GPU_ID=1 bash exec_iemocap_angle_sweep.sh
+```
+
+This runs `angle_weight` values `0.01`, `0.1`, and `1.0` over seeds
+2024-2033. Set `ANGLE_PRIOR=equal` to use the equal-spacing prior instead of
+the default NRC-VAD prior.
 
 Run all three CircularCSE architectures with NRC-VAD geometry over seeds
 2024-2033:
@@ -273,6 +337,13 @@ contains:
 - target, observed, and error similarity matrices;
 - heatmaps and deterministic PCA plots.
 
+Learnable-angle runs additionally contain:
+
+- `angle_history.csv` with epoch-level angles and consecutive gaps;
+- `learned_circular_geometry.json` from the selected checkpoint;
+- prior angles, learned angles, gaps, offsets, and target similarities in
+  the checkpoint and summary.
+
 The three `features_*.npz` files follow the established
 `results/alv_IEMOCAP_20260630_054819/features_train.npz` contract:
 
@@ -292,8 +363,8 @@ feature_fusion
 ```
 
 All non-`sdt` modes also add `feature_embedding`, containing the normalized
-fusion projection used by their fusion cosine classifier and, in the two
-CircularCSE modes, by CircularCSE.
+fusion projection used by their fusion cosine classifier and, in CircularCSE
+modes, by CircularCSE.
 `sdt_cse_all_cosine` additionally stores `feature_l_embedding`,
 `feature_a_embedding`, and `feature_v_embedding`, which are the normalized
 text, audio, and visual projections used by their respective cosine
@@ -325,9 +396,10 @@ python aggregate_results.py --output-dir results
 python -m unittest discover -s tests -v
 ```
 
-The tests cover the circular target, loss gradients, padding masks,
-self-distillation, the fixed split, fusion-head modes, and original SDT
-feature/logit parity for the linear control.
+The tests cover fixed and learnable circular targets, ordered positive gaps,
+angle gradients and checkpoint restoration, padding masks, self-distillation,
+the fixed split, fusion-head modes, and original SDT feature/logit parity for
+the linear control.
 
 ## References
 

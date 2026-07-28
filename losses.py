@@ -168,7 +168,7 @@ class CircularCSELoss(nn.Module):
             build_target_similarity(class_angles).detach().clone(),
         )
 
-    def forward(self, embeddings, labels):
+    def forward(self, embeddings, labels, class_angles=None):
         if embeddings.ndim != 2:
             raise ValueError("embeddings must have shape [N, D]")
         if labels.ndim != 1:
@@ -179,10 +179,21 @@ class CircularCSELoss(nn.Module):
             )
         if not torch.isfinite(embeddings).all():
             raise ValueError("embeddings must contain only finite values")
+        active_class_angles = (
+            self.class_angles
+            if class_angles is None
+            else class_angles
+        )
+        if active_class_angles.ndim != 1:
+            raise ValueError("class_angles must be one-dimensional")
+        if not torch.isfinite(active_class_angles).all():
+            raise ValueError(
+                "class_angles must contain only finite values"
+            )
         if labels.numel() > 0:
             if labels.min().item() < 0:
                 raise ValueError("labels must be nonnegative")
-            if labels.max().item() >= self.class_angles.numel():
+            if labels.max().item() >= active_class_angles.numel():
                 raise ValueError("label exceeds the configured class count")
 
         embeddings = F.normalize(
@@ -193,10 +204,17 @@ class CircularCSELoss(nn.Module):
             return embeddings.sum() * 0.0
 
         predicted = torch.matmul(embeddings, embeddings.t())
-        target_table = self.target_similarity.to(
-            device=predicted.device,
-            dtype=predicted.dtype,
-        )
+        if class_angles is None:
+            target_table = self.target_similarity.to(
+                device=predicted.device,
+                dtype=predicted.dtype,
+            )
+        else:
+            dynamic_angles = active_class_angles.to(
+                device=predicted.device,
+                dtype=predicted.dtype,
+            )
+            target_table = build_target_similarity(dynamic_angles)
         target = target_table[labels[:, None], labels[None, :]]
         same_class = labels[:, None].eq(labels[None, :])
         off_diagonal = ~torch.eye(
@@ -225,12 +243,14 @@ def compute_sdt_cse_losses(
     unimodal_ce_weight=1.0,
     distillation_weight=1.0,
     circular_weight=0.0,
+    angle_weight=0.0,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
         "unimodal_ce_weight": unimodal_ce_weight,
         "distillation_weight": distillation_weight,
         "circular_weight": circular_weight,
+        "angle_weight": angle_weight,
     }.items():
         if value < 0:
             raise ValueError("{} must be nonnegative".format(name))
@@ -314,16 +334,26 @@ def compute_sdt_cse_losses(
         )[valid]
         valid_labels = labels.reshape(-1)[valid]
         circular = circular_loss_function(
-            valid_embeddings, valid_labels
+            valid_embeddings,
+            valid_labels,
+            class_angles=outputs.get("class_angles"),
         )
 
     unimodal_ce = text_ce + audio_ce + visual_ce
     distillation = text_kl + audio_kl + visual_kl
+    angle_regularization = outputs["fusion_logits"].sum() * 0.0
+    if outputs.get("angle_regularization") is not None:
+        angle_regularization = outputs["angle_regularization"]
+    elif angle_weight > 0:
+        raise ValueError(
+            "positive angle_weight requires learnable circular angles"
+        )
     total = (
         fusion_ce_weight * fusion_ce
         + unimodal_ce_weight * unimodal_ce
         + distillation_weight * distillation
         + circular_weight * circular
+        + angle_weight * angle_regularization
     )
     return {
         "total_loss": total,
@@ -337,4 +367,5 @@ def compute_sdt_cse_losses(
         "visual_kl": visual_kl,
         "distillation": distillation,
         "circular_cse": circular,
+        "angle_regularization": angle_regularization,
     }

@@ -83,6 +83,23 @@ class CircularCSELossTest(unittest.TestCase):
                 vad_center=(0.960, 0.732),
             )
 
+    def test_dynamic_target_angles_receive_gradients(self):
+        torch.manual_seed(29)
+        embeddings = torch.randn(6, 5, requires_grad=True)
+        labels = torch.arange(6)
+        angles = build_iemocap_angles(
+            geometry="nrc_vad"
+        ).requires_grad_()
+        loss = CircularCSELoss()(
+            embeddings,
+            labels,
+            class_angles=angles,
+        )
+        loss.backward()
+        self.assertIsNotNone(angles.grad)
+        self.assertTrue(torch.isfinite(angles.grad).all())
+        self.assertGreater(float(angles.grad.abs().sum()), 0.0)
+
     def test_ideal_circle_embeddings_have_zero_loss(self):
         angles = build_iemocap_angles()
         embeddings = torch.stack(

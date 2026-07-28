@@ -1,6 +1,8 @@
 import importlib.util
+import math
 import os
 import sys
+import tempfile
 import unittest
 
 import torch
@@ -14,13 +16,24 @@ if PROJECT_DIR not in sys.path:
 
 from losses import (  # noqa: E402
     CircularCSELoss,
+    build_iemocap_angles,
+    build_target_similarity,
     compute_sdt_cse_losses,
     iemocap_class_weights,
 )
 from model import (  # noqa: E402
+    CIRCLE_ORDER,
     CosineEmotionClassifier,
+    LearnableCircularAngles,
     SDTCSEModel,
     SphericalFusionHead,
+)
+from train import (  # noqa: E402
+    angle_history_row,
+    build_argument_parser,
+    build_optimizer,
+    save_checkpoint,
+    validate_arguments,
 )
 
 
@@ -50,7 +63,7 @@ def make_inputs():
     )
 
 
-def make_model(mode):
+def make_model(mode, initial_class_angles=None):
     return SDTCSEModel(
         d_text=5,
         d_visual=4,
@@ -63,6 +76,7 @@ def make_model(mode):
         experiment_mode=mode,
         embedding_dim=6,
         projection_dropout=0.0,
+        initial_class_angles=initial_class_angles,
     )
 
 
@@ -75,6 +89,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse",
             "sdt_cse_all_cosine",
             "sdt_cse_fusion_only",
+            "sdt_cse_learnable_angles",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
@@ -169,6 +184,20 @@ class ModelModeTest(unittest.TestCase):
                 self.assertIsNone(model.text_projector)
                 self.assertIsNone(model.audio_projector)
                 self.assertIsNone(model.visual_projector)
+            if mode == "sdt_cse_learnable_angles":
+                self.assertIsNotNone(model.circular_angle_learner)
+                self.assertEqual(outputs["class_angles"].shape, (6,))
+                self.assertEqual(outputs["angle_gaps"].shape, (6,))
+                self.assertEqual(outputs["angle_offsets"].shape, (6,))
+                self.assertEqual(
+                    outputs["angle_regularization"].ndim, 0
+                )
+            else:
+                self.assertIsNone(model.circular_angle_learner)
+                self.assertIsNone(outputs["class_angles"])
+                self.assertIsNone(outputs["angle_gaps"])
+                self.assertIsNone(outputs["angle_offsets"])
+                self.assertIsNone(outputs["angle_regularization"])
 
     def test_cse_gradients_reach_encoder_and_unimodal_heads(self):
         model = make_model("sdt_cse")
@@ -283,6 +312,288 @@ class ModelModeTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(losses["total_loss"], expected))
         self.assertEqual(float(losses["circular_cse"]), 0.0)
+
+
+class LearnableCircularAnglesTest(unittest.TestCase):
+    def test_equal_and_nrc_priors_are_reproduced_at_initialization(self):
+        for geometry in ("equal", "nrc_vad"):
+            prior = build_iemocap_angles(geometry=geometry)
+            learner = LearnableCircularAngles(
+                prior_angles=prior,
+                circle_order=CIRCLE_ORDER,
+            )
+            angles = learner()
+            gaps = learner.normalized_gaps()
+            self.assertTrue(
+                torch.allclose(
+                    build_target_similarity(angles),
+                    build_target_similarity(prior),
+                    atol=1e-6,
+                )
+            )
+            self.assertAlmostEqual(float(angles[0]), 0.0, places=6)
+            self.assertTrue(torch.all(gaps > 0))
+            self.assertAlmostEqual(
+                float(gaps.sum()), 2.0 * math.pi, places=5
+            )
+            ordered = angles[torch.tensor(CIRCLE_ORDER)]
+            self.assertTrue(torch.all(ordered[1:] > ordered[:-1]))
+            self.assertLess(float(ordered[-1]), 2.0 * math.pi)
+            self.assertLess(float(learner.regularization()), 1e-10)
+
+    def test_arbitrary_parameters_preserve_order_and_circumference(self):
+        learner = LearnableCircularAngles()
+        with torch.no_grad():
+            learner.raw_gaps.copy_(
+                torch.tensor([-8.0, 4.0, -2.0, 1.0, 7.0, -5.0])
+            )
+        angles = learner()
+        gaps = learner.normalized_gaps()
+        ordered = angles[torch.tensor(CIRCLE_ORDER)]
+        self.assertTrue(torch.all(gaps > 0))
+        self.assertTrue(torch.all(ordered[1:] > ordered[:-1]))
+        self.assertAlmostEqual(
+            float(gaps.sum()), 2.0 * math.pi, places=5
+        )
+        self.assertEqual(float(angles[0]), 0.0)
+
+    def test_angle_regularization_has_finite_gap_gradients(self):
+        learner = LearnableCircularAngles(
+            prior_angles=build_iemocap_angles(geometry="nrc_vad")
+        )
+        with torch.no_grad():
+            learner.raw_gaps[1].add_(0.25)
+        regularization = learner.regularization()
+        self.assertGreater(float(regularization), 0.0)
+        regularization.backward()
+        self.assertIsNotNone(learner.raw_gaps.grad)
+        self.assertTrue(torch.isfinite(learner.raw_gaps.grad).all())
+        self.assertGreater(
+            float(learner.raw_gaps.grad.abs().sum()), 0.0
+        )
+
+    def test_full_model_preserves_sdt_losses_and_trains_angles(self):
+        prior = build_iemocap_angles(geometry="nrc_vad")
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(
+                class_angles=prior
+            ),
+            circular_weight=0.1,
+            angle_weight=0.1,
+        )
+        expected = (
+            losses["fusion_ce"]
+            + losses["unimodal_ce"]
+            + losses["distillation"]
+            + 0.1 * losses["circular_cse"]
+            + 0.1 * losses["angle_regularization"]
+        )
+        self.assertTrue(torch.allclose(losses["total_loss"], expected))
+        self.assertGreater(float(losses["unimodal_ce"]), 0.0)
+        self.assertGreaterEqual(float(losses["distillation"]), 0.0)
+        losses["total_loss"].backward()
+        self.assertIsNotNone(
+            model.circular_angle_learner.raw_gaps.grad
+        )
+        self.assertGreater(
+            float(
+                model.circular_angle_learner.raw_gaps.grad.abs().sum()
+            ),
+            0.0,
+        )
+        self.assertIsNotNone(model.t_output_layer[-1].weight.grad)
+        self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
+
+    def test_angle_weight_only_adds_prior_penalty(self):
+        prior = build_iemocap_angles(geometry="nrc_vad")
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        with torch.no_grad():
+            model.circular_angle_learner.raw_gaps[2].add_(0.3)
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        common = {
+            "outputs": outputs,
+            "labels": labels,
+            "utterance_mask": inputs[3],
+            "class_weights": iemocap_class_weights(),
+            "circular_loss_function": CircularCSELoss(
+                class_angles=prior
+            ),
+            "circular_weight": 0.1,
+        }
+        without_prior = compute_sdt_cse_losses(
+            angle_weight=0.0, **common
+        )
+        with_prior = compute_sdt_cse_losses(
+            angle_weight=0.1, **common
+        )
+        self.assertTrue(
+            torch.allclose(
+                with_prior["total_loss"],
+                without_prior["total_loss"]
+                + 0.1 * with_prior["angle_regularization"],
+            )
+        )
+
+    def test_zero_circular_and_angle_weights_disable_gap_learning(self):
+        prior = build_iemocap_angles(geometry="nrc_vad")
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(
+                class_angles=prior
+            ),
+            circular_weight=0.0,
+            angle_weight=0.0,
+        )
+        losses["total_loss"].backward()
+        gap_gradient = model.circular_angle_learner.raw_gaps.grad
+        self.assertIsNotNone(gap_gradient)
+        self.assertTrue(
+            torch.allclose(gap_gradient, torch.zeros_like(gap_gradient))
+        )
+
+    def test_state_dict_restores_learned_geometry(self):
+        prior = build_iemocap_angles(geometry="nrc_vad")
+        original = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        with torch.no_grad():
+            original.circular_angle_learner.raw_gaps.add_(
+                torch.tensor([0.1, -0.2, 0.3, 0.0, -0.1, 0.2])
+            )
+        restored = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        restored.load_state_dict(original.state_dict())
+        original_state = original.current_circular_angle_state()
+        restored_state = restored.current_circular_angle_state()
+        for key in ("angles", "gaps", "offsets", "regularization"):
+            self.assertTrue(
+                torch.allclose(
+                    original_state[key], restored_state[key]
+                )
+            )
+
+    def test_angle_optimizer_group_has_no_weight_decay(self):
+        model = make_model("sdt_cse_learnable_angles")
+        optimizer = build_optimizer(
+            model,
+            learning_rate=1e-4,
+            weight_decay=1e-5,
+        )
+        raw_gap_id = id(model.circular_angle_learner.raw_gaps)
+        matching_groups = [
+            group
+            for group in optimizer.param_groups
+            if any(
+                id(parameter) == raw_gap_id
+                for parameter in group["params"]
+            )
+        ]
+        self.assertEqual(len(matching_groups), 1)
+        self.assertEqual(matching_groups[0]["weight_decay"], 0.0)
+        base_groups = [
+            group
+            for group in optimizer.param_groups
+            if group is not matching_groups[0]
+        ]
+        self.assertTrue(
+            any(group["weight_decay"] == 1e-5 for group in base_groups)
+        )
+
+    def test_checkpoint_contains_and_restores_angle_metadata(self):
+        prior = build_iemocap_angles(geometry="nrc_vad")
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        with torch.no_grad():
+            model.circular_angle_learner.raw_gaps[3].add_(0.2)
+        optimizer = build_optimizer(model, 1e-4, 1e-5)
+        args = build_argument_parser().parse_args(
+            ["--experiment-mode", "sdt_cse_learnable_angles"]
+        )
+        validate_arguments(args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pt")
+            save_checkpoint(
+                path,
+                model,
+                optimizer,
+                args,
+                {
+                    "training": ["train"],
+                    "validation": ["valid"],
+                    "testing": ["test"],
+                },
+                epoch=4,
+                validation_metrics={"weighted_f1": 70.0},
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+
+        self.assertEqual(
+            checkpoint["circle_order"], list(CIRCLE_ORDER)
+        )
+        self.assertEqual(checkpoint["angle_weight"], 0.1)
+        self.assertEqual(len(checkpoint["raw_gaps"]), 6)
+        self.assertEqual(len(checkpoint["angle_gaps"]), 6)
+        self.assertEqual(len(checkpoint["class_angles"]), 6)
+        expected_angles = (
+            model.current_circular_angle_state()["angles"]
+            .detach()
+            .cpu()
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.tensor(checkpoint["class_angles"]),
+                expected_angles,
+            )
+        )
+        restored = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=prior,
+        )
+        restored.load_state_dict(checkpoint["model_state_dict"])
+        self.assertTrue(
+            torch.allclose(
+                restored.current_circular_angle_state()["angles"],
+                expected_angles,
+            )
+        )
+        history = angle_history_row(4, restored, prior)
+        self.assertEqual(history["epoch"], 4)
+        self.assertIn("angle_happy_degrees", history)
+        self.assertIn(
+            "gap_happy_to_excited_degrees", history
+        )
 
 
 class OriginalSDTParityTest(unittest.TestCase):
