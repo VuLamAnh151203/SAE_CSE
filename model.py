@@ -10,8 +10,14 @@ EXPERIMENT_MODES = (
     "sdt_cosine",
     "sdt_cse",
     "sdt_cse_all_cosine",
+    "sdt_cse_fusion_only",
 )
-CIRCULAR_CSE_MODES = ("sdt_cse", "sdt_cse_all_cosine")
+CIRCULAR_CSE_MODES = (
+    "sdt_cse",
+    "sdt_cse_all_cosine",
+    "sdt_cse_fusion_only",
+)
+FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
 
 
 def gelu(x):
@@ -370,6 +376,10 @@ class SDTCSEModel(nn.Module):
                 num_classes=n_classes,
                 initial_scale=initial_cosine_scale,
             )
+        elif experiment_mode in FUSION_ONLY_MODES:
+            self.t_output_layer = None
+            self.a_output_layer = None
+            self.v_output_layer = None
         else:
             self.t_output_layer = nn.Sequential(
                 nn.ReLU(),
@@ -556,6 +566,10 @@ class SDTCSEModel(nn.Module):
             text_logits = self.t_output_layer(text_embeddings)
             audio_logits = self.a_output_layer(audio_embeddings)
             visual_logits = self.v_output_layer(visual_embeddings)
+        elif self.experiment_mode in FUSION_ONLY_MODES:
+            text_logits = None
+            audio_logits = None
+            visual_logits = None
         else:
             text_logits = self.t_output_layer(text_hidden)
             audio_logits = self.a_output_layer(audio_hidden)

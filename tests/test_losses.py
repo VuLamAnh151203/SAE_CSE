@@ -139,7 +139,44 @@ class SelfDistillationLossTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(first, second))
 
+    def test_fusion_only_outputs_skip_unimodal_ce_and_kl(self):
+        outputs = self._outputs()
+        outputs["text_logits"] = None
+        outputs["audio_logits"] = None
+        outputs["visual_logits"] = None
+        labels = torch.tensor([[0, 1, 2], [3, 4, 0]])
+        mask = torch.tensor([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            mask,
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+        )
+        self.assertEqual(float(losses["unimodal_ce"]), 0.0)
+        self.assertEqual(float(losses["distillation"]), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                losses["total_loss"],
+                losses["fusion_ce"]
+                + 0.1 * losses["circular_cse"],
+            )
+        )
+
+    def test_partial_unimodal_logits_are_rejected(self):
+        outputs = self._outputs()
+        outputs["audio_logits"] = None
+        labels = torch.tensor([[0, 1, 2], [3, 4, 0]])
+        mask = torch.ones(2, 3)
+        with self.assertRaises(ValueError):
+            compute_sdt_cse_losses(
+                outputs,
+                labels,
+                mask,
+                iemocap_class_weights(),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
-

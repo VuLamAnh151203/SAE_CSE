@@ -14,6 +14,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cosine` | Spherical projection + cosine | Original linear | Yes | No |
 | `sdt_cse` | Spherical projection + cosine | Original linear | Yes | Yes |
 | `sdt_cse_all_cosine` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Yes |
+| `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -35,6 +36,8 @@ The comparisons have distinct purposes:
 - `sdt_cse - sdt` measures the complete proposed model change.
 - `sdt_cse_all_cosine - sdt_cse` isolates replacing the three original
   unimodal classifiers with cosine classifiers.
+- `sdt_cse_fusion_only - sdt_cse` measures the contribution of the three
+  unimodal CE losses and self-distillation branches.
 
 ## Data split
 
@@ -79,6 +82,15 @@ For `sdt_cse` and `sdt_cse_all_cosine`, the complete objective is:
 ```text
 SDT objective + circular_weight * CircularCSE
 ```
+
+For `sdt_cse_fusion_only`, the encoders and hierarchical fusion are
+unchanged, but no unimodal classifiers are constructed. Its objective is:
+
+```text
+fusion CE + circular_weight * CircularCSE
+```
+
+Consequently, all logged unimodal CE and KL components are exactly zero.
 
 The emotion order is:
 
@@ -126,9 +138,10 @@ Run the corresponding controls:
 python train.py --experiment-mode sdt --seed 2024
 python train.py --experiment-mode sdt_cosine --seed 2024
 python train.py --experiment-mode sdt_cse_all_cosine --seed 2024
+python train.py --experiment-mode sdt_cse_fusion_only --seed 2024
 ```
 
-Run all four modes over ten initialization seeds and aggregate them:
+Run all five modes over ten initialization seeds and aggregate them:
 
 ```bash
 bash exec_iemocap.sh

@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/results"
 GPU_ID="${GPU_ID:-0}"
 
-for mode in sdt sdt_cosine sdt_cse sdt_cse_all_cosine
+for mode in \
+  sdt \
+  sdt_cosine \
+  sdt_cse \
+  sdt_cse_all_cosine \
+  sdt_cse_fusion_only
 do
   for seed in $(seq 2024 2033)
   do

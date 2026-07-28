@@ -74,13 +74,30 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cosine",
             "sdt_cse",
             "sdt_cse_all_cosine",
+            "sdt_cse_fusion_only",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
                 outputs = model(*inputs)
             self.assertEqual(outputs["fusion_features"].shape, (2, 4, 8))
             self.assertEqual(outputs["fusion_logits"].shape, (2, 4, 6))
-            self.assertEqual(outputs["text_logits"].shape, (2, 4, 6))
+            if mode == "sdt_cse_fusion_only":
+                self.assertIsNone(outputs["text_logits"])
+                self.assertIsNone(outputs["audio_logits"])
+                self.assertIsNone(outputs["visual_logits"])
+                self.assertIsNone(model.t_output_layer)
+                self.assertIsNone(model.a_output_layer)
+                self.assertIsNone(model.v_output_layer)
+            else:
+                self.assertEqual(
+                    outputs["text_logits"].shape, (2, 4, 6)
+                )
+                self.assertEqual(
+                    outputs["audio_logits"].shape, (2, 4, 6)
+                )
+                self.assertEqual(
+                    outputs["visual_logits"].shape, (2, 4, 6)
+                )
             if mode == "sdt":
                 self.assertIsNone(outputs["embeddings"])
                 self.assertIsNone(model.fusion_projector)
@@ -204,6 +221,47 @@ class ModelModeTest(unittest.TestCase):
             self.assertIsNotNone(projector.linear_2.weight.grad)
             self.assertIsNotNone(classifier.class_weights.grad)
             self.assertIsNotNone(classifier.log_scale.grad)
+
+    def test_fusion_only_mode_has_no_unimodal_losses_or_parameters(self):
+        model = make_model("sdt_cse_fusion_only")
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+        )
+        expected = (
+            losses["fusion_ce"] + 0.1 * losses["circular_cse"]
+        )
+        self.assertTrue(torch.allclose(losses["total_loss"], expected))
+        for name in (
+            "text_ce",
+            "audio_ce",
+            "visual_ce",
+            "unimodal_ce",
+            "text_kl",
+            "audio_kl",
+            "visual_kl",
+            "distillation",
+        ):
+            self.assertEqual(float(losses[name]), 0.0)
+        parameter_names = {
+            name for name, _ in model.named_parameters()
+        }
+        self.assertFalse(
+            any("output_layer" in name for name in parameter_names)
+        )
+
+        losses["total_loss"].backward()
+        self.assertIsNotNone(model.textf_input.weight.grad)
+        self.assertIsNotNone(model.last_gate.fc.weight.grad)
+        self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
+        self.assertIsNotNone(model.cosine_classifier.class_weights.grad)
 
     def test_cosine_control_has_no_circular_term(self):
         model = make_model("sdt_cosine")

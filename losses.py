@@ -193,43 +193,62 @@ def compute_sdt_cse_losses(
         utterance_mask,
         class_weights,
     )
-    text_ce = masked_weighted_cross_entropy(
+    unimodal_logits = (
         outputs["text_logits"],
-        labels,
-        utterance_mask,
-        class_weights,
-    )
-    audio_ce = masked_weighted_cross_entropy(
         outputs["audio_logits"],
-        labels,
-        utterance_mask,
-        class_weights,
-    )
-    visual_ce = masked_weighted_cross_entropy(
         outputs["visual_logits"],
-        labels,
-        utterance_mask,
-        class_weights,
     )
+    available = tuple(logits is not None for logits in unimodal_logits)
+    if any(available) and not all(available):
+        raise ValueError(
+            "unimodal logits must either all be present or all be None"
+        )
+    if all(available):
+        text_ce = masked_weighted_cross_entropy(
+            outputs["text_logits"],
+            labels,
+            utterance_mask,
+            class_weights,
+        )
+        audio_ce = masked_weighted_cross_entropy(
+            outputs["audio_logits"],
+            labels,
+            utterance_mask,
+            class_weights,
+        )
+        visual_ce = masked_weighted_cross_entropy(
+            outputs["visual_logits"],
+            labels,
+            utterance_mask,
+            class_weights,
+        )
 
-    text_kl = masked_self_distillation_kl(
-        outputs["text_logits"],
-        outputs["fusion_logits"],
-        utterance_mask,
-        temperature,
-    )
-    audio_kl = masked_self_distillation_kl(
-        outputs["audio_logits"],
-        outputs["fusion_logits"],
-        utterance_mask,
-        temperature,
-    )
-    visual_kl = masked_self_distillation_kl(
-        outputs["visual_logits"],
-        outputs["fusion_logits"],
-        utterance_mask,
-        temperature,
-    )
+        text_kl = masked_self_distillation_kl(
+            outputs["text_logits"],
+            outputs["fusion_logits"],
+            utterance_mask,
+            temperature,
+        )
+        audio_kl = masked_self_distillation_kl(
+            outputs["audio_logits"],
+            outputs["fusion_logits"],
+            utterance_mask,
+            temperature,
+        )
+        visual_kl = masked_self_distillation_kl(
+            outputs["visual_logits"],
+            outputs["fusion_logits"],
+            utterance_mask,
+            temperature,
+        )
+    else:
+        zero = outputs["fusion_logits"].sum() * 0.0
+        text_ce = zero
+        audio_ce = zero
+        visual_ce = zero
+        text_kl = zero
+        audio_kl = zero
+        visual_kl = zero
 
     circular = outputs["fusion_logits"].sum() * 0.0
     if circular_weight > 0:
@@ -271,4 +290,3 @@ def compute_sdt_cse_losses(
         "distillation": distillation,
         "circular_cse": circular,
     }
-

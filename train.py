@@ -29,7 +29,12 @@ from losses import (
     compute_sdt_cse_losses,
     iemocap_class_weights,
 )
-from model import CIRCULAR_CSE_MODES, EXPERIMENT_MODES, SDTCSEModel
+from model import (
+    CIRCULAR_CSE_MODES,
+    EXPERIMENT_MODES,
+    FUSION_ONLY_MODES,
+    SDTCSEModel,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -571,6 +576,9 @@ def validate_arguments(args):
             ))
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
+    if args.experiment_mode in FUSION_ONLY_MODES:
+        args.unimodal_ce_weight = 0.0
+        args.distillation_weight = 0.0
 
 
 def train_and_test(args):
