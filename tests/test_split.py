@@ -9,7 +9,7 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 from dataloader import fixed_train_validation_test_split  # noqa: E402
-from train import is_better_validation  # noqa: E402
+from train import experiment_directory_name, is_better_validation  # noqa: E402
 
 
 class FixedSplitTest(unittest.TestCase):
@@ -41,7 +41,16 @@ class FixedSplitTest(unittest.TestCase):
         self.assertTrue(is_better_validation(70.0, 0.4, 70.0, 0.5))
         self.assertFalse(is_better_validation(70.0, 0.6, 70.0, 0.5))
 
+    def test_nonuniform_geometry_has_an_independent_run_directory(self):
+        self.assertEqual(
+            experiment_directory_name("sdt_cse", 0.1, "equal"),
+            "sdt_cse_lambda_0.1",
+        )
+        self.assertEqual(
+            experiment_directory_name("sdt_cse", 0.1, "nrc_vad"),
+            "sdt_cse_nrc_vad_lambda_0.1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

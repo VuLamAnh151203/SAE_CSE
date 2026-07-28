@@ -8,9 +8,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from sklearn.decomposition import PCA
 
-from losses import EMOTION_NAMES, build_iemocap_angles, build_target_similarity
+from losses import (
+    CIRCULAR_GEOMETRIES,
+    EMOTION_NAMES,
+    build_iemocap_angles,
+    build_target_similarity,
+)
 
 
 def _normalize_rows(values):
@@ -46,12 +52,16 @@ def observed_similarity_matrix(embeddings, labels, num_classes=6):
     return matrix, counts
 
 
-def compute_geometry_metrics(embeddings, labels):
+def compute_geometry_metrics(embeddings, labels, class_angles=None):
     raw = np.asarray(embeddings, dtype=np.float64)
     normalized = _normalize_rows(raw)
     observed, counts = observed_similarity_matrix(normalized, labels)
+    if class_angles is None:
+        class_angles = build_iemocap_angles()
+    else:
+        class_angles = torch.as_tensor(class_angles)
     target = (
-        build_target_similarity(build_iemocap_angles())
+        build_target_similarity(class_angles)
         .detach()
         .cpu()
         .numpy()
@@ -160,10 +170,13 @@ def save_geometry_artifacts(
     prefix,
     embeddings,
     labels,
+    class_angles=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     metrics, observed, target, normalized = compute_geometry_metrics(
-        embeddings, labels
+        embeddings,
+        labels,
+        class_angles=class_angles,
     )
     with open(
         os.path.join(output_dir, "{}_metrics.json".format(prefix)),
@@ -218,6 +231,17 @@ def main():
         choices=["fusion_features", "embeddings"],
         required=True,
     )
+    parser.add_argument(
+        "--circular-geometry",
+        choices=CIRCULAR_GEOMETRIES,
+        default="equal",
+    )
+    parser.add_argument(
+        "--vad-center-valence", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--vad-center-arousal", type=float, default=0.5
+    )
     args = parser.parse_args()
     archive = np.load(args.npz)
     if args.representation not in archive:
@@ -229,9 +253,15 @@ def main():
         args.representation,
         archive[args.representation],
         archive["labels"],
+        class_angles=build_iemocap_angles(
+            geometry=args.circular_geometry,
+            vad_center=(
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ),
+        ),
     )
 
 
 if __name__ == "__main__":
     main()
-

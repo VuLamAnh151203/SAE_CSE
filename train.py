@@ -21,10 +21,12 @@ from sklearn.metrics import (
 from analyze_geometry import save_geometry_artifacts
 from dataloader import DEFAULT_FEATURE_PATH, create_iemocap_loaders
 from losses import (
+    CIRCULAR_GEOMETRIES,
     CircularCSELoss,
     EMOTION_NAMES,
     ID2EMOTION,
     build_iemocap_angles,
+    build_iemocap_vad_anchors,
     build_target_similarity,
     compute_sdt_cse_losses,
     iemocap_class_weights,
@@ -504,10 +506,20 @@ def is_better_validation(
     return False
 
 
-def experiment_directory_name(mode, circular_weight):
+def experiment_directory_name(
+    mode,
+    circular_weight,
+    circular_geometry="equal",
+):
     if mode in CIRCULAR_CSE_MODES:
-        return "{}_lambda_{}".format(
-            mode, format(float(circular_weight), "g")
+        geometry_suffix = (
+            "" if circular_geometry == "equal"
+            else "_{}".format(circular_geometry)
+        )
+        return "{}{}_lambda_{}".format(
+            mode,
+            geometry_suffix,
+            format(float(circular_weight), "g"),
         )
     return mode
 
@@ -521,12 +533,24 @@ def save_checkpoint(
     epoch,
     validation_metrics,
 ):
-    angles = build_iemocap_angles()
+    angles = build_iemocap_angles(
+        geometry=args.circular_geometry,
+        vad_center=(
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ),
+    )
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": vars(args).copy(),
         "emotion_mapping": ID2EMOTION,
+        "circular_geometry": args.circular_geometry,
+        "vad_center": [
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ],
+        "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
         "class_angles": angles.tolist(),
         "target_similarity": build_target_similarity(angles).tolist(),
         "class_weights": iemocap_class_weights().tolist(),
@@ -574,8 +598,20 @@ def validate_arguments(args):
             raise ValueError("--{} must be nonnegative".format(
                 name.replace("_", "-")
             ))
+    if not np.isfinite(args.vad_center_valence):
+        raise ValueError("--vad-center-valence must be finite")
+    if not np.isfinite(args.vad_center_arousal):
+        raise ValueError("--vad-center-arousal must be finite")
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
+        args.circular_geometry = "equal"
+    build_iemocap_angles(
+        geometry=args.circular_geometry,
+        vad_center=(
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ),
+    )
     if args.experiment_mode in FUSION_ONLY_MODES:
         args.unimodal_ce_weight = 0.0
         args.distillation_weight = 0.0
@@ -596,7 +632,9 @@ def train_and_test(args):
     run_dir = os.path.join(
         os.path.abspath(args.output_dir),
         experiment_directory_name(
-            args.experiment_mode, args.circular_weight
+            args.experiment_mode,
+            args.circular_weight,
+            args.circular_geometry,
         ),
         "seed_{}".format(args.seed),
     )
@@ -628,9 +666,39 @@ def train_and_test(args):
         initial_cosine_scale=args.initial_cosine_scale,
     ).to(device)
     class_weights = iemocap_class_weights(device=device)
+    class_angles = build_iemocap_angles(
+        device=device,
+        geometry=args.circular_geometry,
+        vad_center=(
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ),
+    )
+    write_json(
+        os.path.join(run_dir, "circular_geometry.json"),
+        {
+            "geometry": args.circular_geometry,
+            "vad_center": [
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ],
+            "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
+            "class_angles_radians": (
+                class_angles.detach().cpu().tolist()
+            ),
+            "class_angles_degrees": (
+                class_angles.detach().cpu()
+                * (180.0 / np.pi)
+            ).tolist(),
+            "target_similarity": build_target_similarity(
+                class_angles
+            ).detach().cpu().tolist(),
+        },
+    )
     circular_loss_function = (
         CircularCSELoss(
-            same_class_margin=args.same_class_margin
+            class_angles=class_angles,
+            same_class_margin=args.same_class_margin,
         ).to(device)
         if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
@@ -804,6 +872,7 @@ def train_and_test(args):
         "fusion_features",
         testing["fusion_features_array"],
         testing["labels_array"],
+        class_angles=class_angles,
     )
     projected_geometry = None
     if testing["embeddings_array"] is not None:
@@ -812,6 +881,7 @@ def train_and_test(args):
             "embeddings",
             testing["embeddings_array"],
             testing["labels_array"],
+            class_angles=class_angles,
         )
     unimodal_projected_geometry = {}
     for representation_name, result_name in (
@@ -826,12 +896,19 @@ def train_and_test(args):
                     representation_name,
                     testing[result_name],
                     testing["labels_array"],
+                    class_angles=class_angles,
                 )
             )
     summary = {
         "experiment_mode": args.experiment_mode,
         "seed": args.seed,
         "circular_weight": args.circular_weight,
+        "circular_geometry": args.circular_geometry,
+        "vad_center": [
+            args.vad_center_valence,
+            args.vad_center_arousal,
+        ],
+        "class_angles": class_angles.detach().cpu().tolist(),
         "selected_epoch": best_epoch,
         "training": training_metrics,
         "validation": validation_metrics,
@@ -885,6 +962,21 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--same-class-margin", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--circular-geometry",
+        choices=CIRCULAR_GEOMETRIES,
+        default="equal",
+        help=(
+            "equal uses the original six equally spaced angles; "
+            "nrc_vad derives nonuniform angles from NRC-VAD anchors"
+        ),
+    )
+    parser.add_argument(
+        "--vad-center-valence", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--vad-center-arousal", type=float, default=0.5
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)

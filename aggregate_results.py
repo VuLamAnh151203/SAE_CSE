@@ -37,8 +37,15 @@ def condition_name(summary):
         "sdt_cse_all_cosine",
         "sdt_cse_fusion_only",
     ):
-        return "{}_lambda_{}".format(
-            mode, format(float(summary["circular_weight"]), "g")
+        geometry = summary.get("circular_geometry", "equal")
+        geometry_suffix = (
+            "" if geometry == "equal"
+            else "_{}".format(geometry)
+        )
+        return "{}{}_lambda_{}".format(
+            mode,
+            geometry_suffix,
+            format(float(summary["circular_weight"]), "g"),
         )
     return mode
 

@@ -14,6 +14,7 @@ if PROJECT_DIR not in sys.path:
 from losses import (  # noqa: E402
     CircularCSELoss,
     build_iemocap_angles,
+    build_iemocap_vad_anchors,
     build_target_similarity,
     compute_sdt_cse_losses,
     iemocap_class_weights,
@@ -37,6 +38,50 @@ class CircularCSELossTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(target, expected, atol=1e-6))
         self.assertTrue(torch.allclose(target, target.t()))
+
+    def test_nrc_vad_angles_match_nonuniform_affect_geometry(self):
+        angles = build_iemocap_angles(geometry="nrc_vad")
+        expected_degrees = torch.tensor(
+            [
+                26.764,
+                205.324,
+                264.397,
+                132.375,
+                46.570,
+                152.403,
+            ]
+        )
+        actual_degrees = angles * 180.0 / math.pi
+        self.assertTrue(
+            torch.allclose(
+                actual_degrees,
+                expected_degrees,
+                atol=1e-3,
+            )
+        )
+
+        anchors = build_iemocap_vad_anchors()
+        center = torch.tensor([0.5, 0.5])
+        reconstructed = torch.remainder(
+            torch.atan2(
+                anchors[:, 1] - center[1],
+                anchors[:, 0] - center[0],
+            ),
+            2.0 * math.pi,
+        )
+        self.assertTrue(torch.allclose(angles, reconstructed))
+        self.assertFalse(
+            torch.allclose(angles, build_iemocap_angles())
+        )
+
+    def test_nrc_vad_geometry_rejects_undefined_or_unknown_angles(self):
+        with self.assertRaises(ValueError):
+            build_iemocap_angles(geometry="unknown")
+        with self.assertRaises(ValueError):
+            build_iemocap_angles(
+                geometry="nrc_vad",
+                vad_center=(0.960, 0.732),
+            )
 
     def test_ideal_circle_embeddings_have_zero_loss(self):
         angles = build_iemocap_angles()

@@ -64,7 +64,7 @@ into training.
 
 ## Objective
 
-For all modes, the preserved SDT objective is:
+For all modes with unimodal classifiers, the preserved SDT objective is:
 
 ```text
 fusion CE
@@ -108,6 +108,40 @@ CircularCSE is computed from every ordered pair of valid projected fusion
 embeddings in a minibatch. Padded utterances and diagonal self-pairs are
 excluded.
 
+### Circular geometries
+
+`--circular-geometry` selects the target angles independently of the model
+architecture:
+
+- `equal` is the original equally spaced six-emotion circle and remains the
+  default.
+- `nrc_vad` derives non-equally spaced angles from fixed NRC-VAD valence and
+  arousal anchors around a configurable affect-space center.
+
+The nonuniform version uses:
+
+```text
+theta_c = atan2(A_c - A_0, V_c - V_0) mod 2*pi
+```
+
+With the default center `(V_0, A_0) = (0.5, 0.5)`, the anchors and resulting
+angles in label-ID order are:
+
+| ID | Emotion | Valence | Arousal | Angle |
+|---:|---|---:|---:|---:|
+| 0 | happy | 0.960 | 0.732 | 26.764 degrees |
+| 1 | sad | 0.052 | 0.288 | 205.324 degrees |
+| 2 | neutral | 0.469 | 0.184 | 264.397 degrees |
+| 3 | angry | 0.167 | 0.865 | 132.375 degrees |
+| 4 | excited | 0.908 | 0.931 | 46.570 degrees |
+| 5 | frustrated | 0.060 | 0.730 | 152.403 degrees |
+
+Neutral has a defined angle because its NRC-VAD anchor is not exactly the
+center. Configuration is rejected if a custom center exactly coincides with
+any anchor, because `atan2(0, 0)` has no meaningful affective direction.
+The selected angles and complete `6 x 6` target matrix are stored in every
+checkpoint and in `circular_geometry.json`.
+
 ## Commands
 
 Run one primary SDT-CSE experiment:
@@ -120,6 +154,26 @@ python train.py \
   --device cuda \
   --gpu-id 0 \
   --seed 2024
+```
+
+Run the non-equally spaced NRC-VAD version:
+
+```bash
+python train.py \
+  --experiment-mode sdt_cse \
+  --circular-geometry nrc_vad \
+  --vad-center-valence 0.5 \
+  --vad-center-arousal 0.5 \
+  --circular-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
+This writes to:
+
+```text
+results/sdt_cse_nrc_vad_lambda_0.1/seed_2024/
 ```
 
 Select another visible GPU by changing `--gpu-id`, for example:
@@ -157,6 +211,13 @@ Run the predefined CircularCSE sensitivity analysis:
 
 ```bash
 bash exec_iemocap_sweep.sh
+```
+
+Run all three CircularCSE architectures with NRC-VAD geometry over seeds
+2024-2033:
+
+```bash
+GPU_ID=1 bash exec_iemocap_vad.sh
 ```
 
 Existing nonempty run directories are protected. Pass `--overwrite` only when

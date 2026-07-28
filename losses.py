@@ -22,20 +22,68 @@ IEMOCAP_CLASS_FREQUENCIES = (
     0.127711,
     0.252668,
 )
+CIRCULAR_GEOMETRIES = ("equal", "nrc_vad")
+NRC_VAD_ANCHORS = (
+    (0.960, 0.732),  # happy
+    (0.052, 0.288),  # sad
+    (0.469, 0.184),  # neutral
+    (0.167, 0.865),  # angry
+    (0.908, 0.931),  # excited
+    (0.060, 0.730),  # frustrated
+)
 
 
-def build_iemocap_angles(device=None, dtype=torch.float32):
+def build_iemocap_vad_anchors(device=None, dtype=torch.float32):
     return torch.tensor(
-        [
-            0.0,
-            4.0 * math.pi / 3.0,
-            5.0 * math.pi / 3.0,
-            2.0 * math.pi / 3.0,
-            math.pi / 3.0,
-            math.pi,
-        ],
+        NRC_VAD_ANCHORS,
         device=device,
         dtype=dtype,
+    )
+
+
+def build_iemocap_angles(
+    device=None,
+    dtype=torch.float32,
+    geometry="equal",
+    vad_center=(0.5, 0.5),
+):
+    if geometry not in CIRCULAR_GEOMETRIES:
+        raise ValueError(
+            "geometry must be one of {}".format(CIRCULAR_GEOMETRIES)
+        )
+    if geometry == "equal":
+        return torch.tensor(
+            [
+                0.0,
+                4.0 * math.pi / 3.0,
+                5.0 * math.pi / 3.0,
+                2.0 * math.pi / 3.0,
+                math.pi / 3.0,
+                math.pi,
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+    center = torch.as_tensor(
+        vad_center,
+        device=device,
+        dtype=dtype,
+    )
+    if center.shape != (2,):
+        raise ValueError("vad_center must contain valence and arousal")
+    if not torch.isfinite(center).all():
+        raise ValueError("vad_center must contain only finite values")
+    anchors = build_iemocap_vad_anchors(device=device, dtype=dtype)
+    offsets = anchors - center
+    if torch.any(torch.linalg.vector_norm(offsets, dim=-1) <= 1e-8):
+        raise ValueError(
+            "a VAD anchor coincides with the center and has no angle"
+        )
+    angles = torch.atan2(offsets[:, 1], offsets[:, 0])
+    return torch.remainder(
+        angles,
+        angles.new_tensor(2.0 * math.pi),
     )
 
 
