@@ -1,0 +1,819 @@
+import argparse
+import csv
+import json
+import os
+import random
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    recall_score,
+)
+
+from analyze_geometry import save_geometry_artifacts
+from dataloader import DEFAULT_FEATURE_PATH, create_iemocap_loaders
+from losses import (
+    CircularCSELoss,
+    EMOTION_NAMES,
+    ID2EMOTION,
+    build_iemocap_angles,
+    build_target_similarity,
+    compute_sdt_cse_losses,
+    iemocap_class_weights,
+)
+from model import EXPERIMENT_MODES, SDTCSEModel
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_OUTPUT_DIR = os.path.abspath(
+    os.path.join(BASE_DIR, "results")
+)
+LOSS_NAMES = (
+    "total_loss",
+    "fusion_ce",
+    "text_ce",
+    "audio_ce",
+    "visual_ce",
+    "unimodal_ce",
+    "text_kl",
+    "audio_kl",
+    "visual_kl",
+    "distillation",
+    "circular_cse",
+)
+
+
+def set_random_seed(seed, use_cuda):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if use_cuda:
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def resolve_device(device_name):
+    if device_name == "auto":
+        return torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    return torch.device(device_name)
+
+
+def move_batch_to_device(batch, device):
+    moved = dict(batch)
+    for key in (
+        "text",
+        "visual",
+        "audio",
+        "speaker_mask",
+        "utterance_mask",
+        "labels",
+    ):
+        moved[key] = batch[key].to(device)
+    return moved
+
+
+def classification_metrics(labels, predictions):
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    if labels.size == 0:
+        return {
+            "accuracy": float("nan"),
+            "weighted_f1": float("nan"),
+            "macro_f1": float("nan"),
+            "macro_recall": float("nan"),
+        }
+    return {
+        "accuracy": float(accuracy_score(labels, predictions) * 100.0),
+        "weighted_f1": float(
+            f1_score(
+                labels,
+                predictions,
+                average="weighted",
+                zero_division=0,
+            )
+            * 100.0
+        ),
+        "macro_f1": float(
+            f1_score(
+                labels,
+                predictions,
+                average="macro",
+                zero_division=0,
+            )
+            * 100.0
+        ),
+        "macro_recall": float(
+            recall_score(
+                labels,
+                predictions,
+                average="macro",
+                zero_division=0,
+            )
+            * 100.0
+        ),
+    }
+
+
+def _model_forward(model, batch):
+    lengths = (
+        batch["utterance_mask"].sum(dim=1).long().cpu().tolist()
+    )
+    return model(
+        batch["text"],
+        batch["visual"],
+        batch["audio"],
+        batch["utterance_mask"],
+        batch["speaker_mask"].permute(1, 0, 2),
+        lengths,
+    )
+
+
+def run_epoch(
+    model,
+    dataloader,
+    device,
+    class_weights,
+    circular_loss_function,
+    args,
+    optimizer=None,
+    collect_outputs=False,
+):
+    training = optimizer is not None
+    model.train(training)
+    totals = {name: 0.0 for name in LOSS_NAMES}
+    total_utterances = 0
+    all_labels = []
+    all_predictions = []
+    prediction_rows = []
+    text_features = []
+    audio_features = []
+    visual_features = []
+    fusion_features = []
+    projected_embeddings = []
+
+    for batch in dataloader:
+        batch = move_batch_to_device(batch, device)
+        if training:
+            optimizer.zero_grad()
+        with torch.set_grad_enabled(training):
+            outputs = _model_forward(model, batch)
+            losses = compute_sdt_cse_losses(
+                outputs,
+                batch["labels"],
+                batch["utterance_mask"],
+                class_weights,
+                circular_loss_function=circular_loss_function,
+                temperature=args.temperature,
+                fusion_ce_weight=args.fusion_ce_weight,
+                unimodal_ce_weight=args.unimodal_ce_weight,
+                distillation_weight=args.distillation_weight,
+                circular_weight=args.circular_weight,
+            )
+            if training:
+                losses["total_loss"].backward()
+                optimizer.step()
+
+        valid = batch["utterance_mask"].reshape(-1) > 0
+        valid_count = int(valid.sum().item())
+        total_utterances += valid_count
+        for name in LOSS_NAMES:
+            totals[name] += (
+                float(losses[name].detach().cpu().item()) * valid_count
+            )
+
+        flat_logits = outputs["fusion_logits"].reshape(
+            -1, outputs["fusion_logits"].size(-1)
+        )
+        valid_probabilities = F.softmax(
+            flat_logits[valid], dim=-1
+        ).detach()
+        valid_predictions = torch.argmax(
+            valid_probabilities, dim=-1
+        )
+        valid_labels = batch["labels"].reshape(-1)[valid]
+        all_predictions.append(valid_predictions.cpu().numpy())
+        all_labels.append(valid_labels.detach().cpu().numpy())
+
+        if collect_outputs:
+            flat_text = outputs["text_representation"].reshape(
+                -1, outputs["text_representation"].size(-1)
+            )
+            flat_audio = outputs["audio_representation"].reshape(
+                -1, outputs["audio_representation"].size(-1)
+            )
+            flat_visual = outputs["visual_representation"].reshape(
+                -1, outputs["visual_representation"].size(-1)
+            )
+            flat_fusion = outputs["fusion_features"].reshape(
+                -1, outputs["fusion_features"].size(-1)
+            )
+            text_features.append(
+                flat_text[valid].detach().cpu().numpy()
+            )
+            audio_features.append(
+                flat_audio[valid].detach().cpu().numpy()
+            )
+            visual_features.append(
+                flat_visual[valid].detach().cpu().numpy()
+            )
+            fusion_features.append(
+                flat_fusion[valid].detach().cpu().numpy()
+            )
+            if outputs["embeddings"] is not None:
+                flat_embeddings = outputs["embeddings"].reshape(
+                    -1, outputs["embeddings"].size(-1)
+                )
+                projected_embeddings.append(
+                    flat_embeddings[valid].detach().cpu().numpy()
+                )
+
+            probability_tensor = F.softmax(
+                outputs["fusion_logits"], dim=-1
+            ).detach().cpu()
+            label_tensor = batch["labels"].detach().cpu()
+            for dialogue_index, video_id in enumerate(
+                batch["video_ids"]
+            ):
+                length = int(
+                    batch["utterance_mask"][dialogue_index]
+                    .sum()
+                    .item()
+                )
+                utterance_ids = batch["utterance_ids"][dialogue_index]
+                sentences = batch["sentences"][dialogue_index]
+                for utterance_index in range(length):
+                    probabilities = probability_tensor[
+                        dialogue_index, utterance_index
+                    ].numpy()
+                    true_label = int(
+                        label_tensor[dialogue_index, utterance_index]
+                    )
+                    predicted_label = int(np.argmax(probabilities))
+                    row = {
+                        "video_id": video_id,
+                        "utterance_id": utterance_ids[utterance_index],
+                        "utterance_index": utterance_index,
+                        "sentence": sentences[utterance_index],
+                        "true_label": true_label,
+                        "true_emotion": ID2EMOTION[true_label],
+                        "predicted_label": predicted_label,
+                        "predicted_emotion": ID2EMOTION[predicted_label],
+                    }
+                    for class_id, emotion in enumerate(EMOTION_NAMES):
+                        row["probability_{}".format(emotion)] = float(
+                            probabilities[class_id]
+                        )
+                    prediction_rows.append(row)
+
+    if total_utterances == 0:
+        raise RuntimeError("dataloader produced no valid utterances")
+    labels = np.concatenate(all_labels)
+    predictions = np.concatenate(all_predictions)
+    result = {
+        name: totals[name] / total_utterances
+        for name in LOSS_NAMES
+    }
+    result.update(classification_metrics(labels, predictions))
+    scale = model.effective_cosine_scale
+    result["cosine_scale"] = (
+        None if scale is None else float(scale.detach().cpu().item())
+    )
+
+    if collect_outputs:
+        result["labels_array"] = labels
+        result["predictions_array"] = predictions
+        result["prediction_rows"] = prediction_rows
+        result["text_features_array"] = np.concatenate(
+            text_features, axis=0
+        )
+        result["audio_features_array"] = np.concatenate(
+            audio_features, axis=0
+        )
+        result["visual_features_array"] = np.concatenate(
+            visual_features, axis=0
+        )
+        result["fusion_features_array"] = np.concatenate(
+            fusion_features, axis=0
+        )
+        result["embeddings_array"] = (
+            np.concatenate(projected_embeddings, axis=0)
+            if projected_embeddings
+            else None
+        )
+    return result
+
+
+def emotion_to_sentiment(emotion_labels):
+    emotion_labels = np.asarray(emotion_labels, dtype=np.int64)
+    if emotion_labels.size:
+        if emotion_labels.min() < 0 or emotion_labels.max() > 5:
+            raise ValueError("emotion labels must be in [0, 5]")
+    mapping = np.asarray([2, 0, 1, 0, 2, 0], dtype=np.int64)
+    return mapping[emotion_labels]
+
+
+def save_feature_npz(path, result):
+    rows = result.get("prediction_rows")
+    if rows is None:
+        raise ValueError("feature export requires collected prediction rows")
+    labels = np.asarray(result["labels_array"], dtype=np.int64)
+    predictions = np.asarray(
+        result["predictions_array"], dtype=np.int64
+    )
+    if len(rows) != labels.shape[0]:
+        raise ValueError(
+            "metadata row count does not match exported utterances"
+        )
+    export = {
+        "labels_emo": labels,
+        "preds_emo": predictions,
+        "labels_sen": emotion_to_sentiment(labels),
+        "preds_sen": emotion_to_sentiment(predictions),
+        "dialogue_ids": np.asarray(
+            [row["video_id"] for row in rows]
+        ),
+        "utterance_indices": np.asarray(
+            [row["utterance_index"] for row in rows],
+            dtype=np.int64,
+        ),
+        "utterance_ids": np.asarray(
+            [row["utterance_id"] for row in rows]
+        ),
+        "sentences": np.asarray([row["sentence"] for row in rows]),
+        "feature_l": np.asarray(
+            result["text_features_array"], dtype=np.float32
+        ),
+        "feature_v": np.asarray(
+            result["visual_features_array"], dtype=np.float32
+        ),
+        "feature_a": np.asarray(
+            result["audio_features_array"], dtype=np.float32
+        ),
+        "feature_fusion": np.asarray(
+            result["fusion_features_array"], dtype=np.float32
+        ),
+    }
+    if result["embeddings_array"] is not None:
+        export["feature_embedding"] = np.asarray(
+            result["embeddings_array"], dtype=np.float32
+        )
+    expected_rows = labels.shape[0]
+    for name, values in export.items():
+        if values.shape[0] != expected_rows:
+            raise ValueError(
+                "{} has {} rows; expected {}".format(
+                    name, values.shape[0], expected_rows
+                )
+            )
+    np.savez_compressed(path, **export)
+    return path
+
+
+def public_metrics(result):
+    keys = list(LOSS_NAMES) + [
+        "accuracy",
+        "weighted_f1",
+        "macro_f1",
+        "macro_recall",
+        "cosine_scale",
+    ]
+    return {key: result.get(key) for key in keys}
+
+
+def write_json(path, value):
+    with open(path, "w", encoding="utf-8") as output:
+        json.dump(value, output, indent=2, allow_nan=True)
+
+
+def write_rows(path, rows):
+    if not rows:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_epoch_metrics(path, rows):
+    flattened = []
+    for row in rows:
+        item = {"epoch": row["epoch"], "seconds": row["seconds"]}
+        for split in ("training", "validation"):
+            for key, value in row[split].items():
+                item["{}_{}".format(split, key)] = value
+        flattened.append(item)
+    write_rows(path, flattened)
+
+
+def is_better_validation(
+    candidate_f1,
+    candidate_ce,
+    best_f1,
+    best_ce,
+    tolerance=1e-12,
+):
+    if candidate_f1 > best_f1 + tolerance:
+        return True
+    if abs(candidate_f1 - best_f1) <= tolerance:
+        return candidate_ce < best_ce - tolerance
+    return False
+
+
+def experiment_directory_name(mode, circular_weight):
+    if mode == "sdt_cse":
+        return "sdt_cse_lambda_{}".format(
+            format(float(circular_weight), "g")
+        )
+    return mode
+
+
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    args,
+    split_ids,
+    epoch,
+    validation_metrics,
+):
+    angles = build_iemocap_angles()
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": vars(args).copy(),
+        "emotion_mapping": ID2EMOTION,
+        "class_angles": angles.tolist(),
+        "target_similarity": build_target_similarity(angles).tolist(),
+        "class_weights": iemocap_class_weights().tolist(),
+        "split_ids": split_ids,
+        "selected_epoch": epoch,
+        "validation_metrics": validation_metrics,
+    }
+    torch.save(payload, path)
+
+
+def final_classification_details(labels, predictions):
+    return {
+        "classification_report": classification_report(
+            labels,
+            predictions,
+            labels=list(range(6)),
+            target_names=EMOTION_NAMES,
+            digits=6,
+            zero_division=0,
+            output_dict=True,
+        ),
+        "confusion_matrix": confusion_matrix(
+            labels, predictions, labels=list(range(6))
+        ).tolist(),
+    }
+
+
+def validate_arguments(args):
+    if args.epochs < 1:
+        raise ValueError("--epochs must be positive")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive")
+    if args.temperature <= 0:
+        raise ValueError("--temperature must be positive")
+    if args.embedding_dim < 2:
+        raise ValueError("--embedding-dim must be at least 2")
+    for name in (
+        "fusion_ce_weight",
+        "unimodal_ce_weight",
+        "distillation_weight",
+        "circular_weight",
+        "same_class_margin",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError("--{} must be nonnegative".format(
+                name.replace("_", "-")
+            ))
+    if args.experiment_mode != "sdt_cse":
+        args.circular_weight = 0.0
+
+
+def train_and_test(args):
+    validate_arguments(args)
+    device = resolve_device(args.device)
+    set_random_seed(args.seed, device.type == "cuda")
+    loaders = create_iemocap_loaders(
+        feature_path=args.feature_path,
+        batch_size=args.batch_size,
+        validation_ratio=args.validation_ratio,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    run_dir = os.path.join(
+        os.path.abspath(args.output_dir),
+        experiment_directory_name(
+            args.experiment_mode, args.circular_weight
+        ),
+        "seed_{}".format(args.seed),
+    )
+    if os.path.isdir(run_dir) and os.listdir(run_dir) and not args.overwrite:
+        raise FileExistsError(
+            "{} is not empty; use --overwrite to replace matching files".format(
+                run_dir
+            )
+        )
+    os.makedirs(run_dir, exist_ok=True)
+    write_json(os.path.join(run_dir, "config.json"), vars(args))
+    write_json(
+        os.path.join(run_dir, "split_ids.json"),
+        loaders["split_ids"],
+    )
+
+    model = SDTCSEModel(
+        d_text=args.text_dim,
+        d_visual=args.visual_dim,
+        d_audio=args.audio_dim,
+        n_head=args.n_head,
+        n_classes=6,
+        hidden_dim=args.hidden_dim,
+        n_speakers=2,
+        dropout=args.dropout,
+        experiment_mode=args.experiment_mode,
+        embedding_dim=args.embedding_dim,
+        projection_dropout=args.projection_dropout,
+        initial_cosine_scale=args.initial_cosine_scale,
+    ).to(device)
+    class_weights = iemocap_class_weights(device=device)
+    circular_loss_function = (
+        CircularCSELoss(
+            same_class_margin=args.same_class_margin
+        ).to(device)
+        if args.experiment_mode == "sdt_cse"
+        else None
+    )
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    best_path = os.path.join(run_dir, "best_checkpoint.pt")
+    best_f1 = -float("inf")
+    best_ce = float("inf")
+    best_epoch = None
+    best_validation = None
+    epoch_rows = []
+
+    for epoch in range(1, args.epochs + 1):
+        started = time.time()
+        training = run_epoch(
+            model,
+            loaders["training"],
+            device,
+            class_weights,
+            circular_loss_function,
+            args,
+            optimizer=optimizer,
+        )
+        with torch.no_grad():
+            validation = run_epoch(
+                model,
+                loaders["validation"],
+                device,
+                class_weights,
+                circular_loss_function,
+                args,
+            )
+        row = {
+            "epoch": epoch,
+            "seconds": time.time() - started,
+            "training": public_metrics(training),
+            "validation": public_metrics(validation),
+        }
+        epoch_rows.append(row)
+        write_epoch_metrics(
+            os.path.join(run_dir, "epoch_metrics.csv"),
+            epoch_rows,
+        )
+        print(
+            "epoch={} train_total={:.6f} train_wf1={:.4f} "
+            "valid_total={:.6f} valid_wf1={:.4f}".format(
+                epoch,
+                training["total_loss"],
+                training["weighted_f1"],
+                validation["total_loss"],
+                validation["weighted_f1"],
+            ),
+            flush=True,
+        )
+        if is_better_validation(
+            validation["weighted_f1"],
+            validation["fusion_ce"],
+            best_f1,
+            best_ce,
+        ):
+            best_f1 = validation["weighted_f1"]
+            best_ce = validation["fusion_ce"]
+            best_epoch = epoch
+            best_validation = public_metrics(validation)
+            save_checkpoint(
+                best_path,
+                model,
+                optimizer,
+                args,
+                loaders["split_ids"],
+                epoch,
+                best_validation,
+            )
+
+    checkpoint = torch.load(best_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    with torch.no_grad():
+        selected_training = run_epoch(
+            model,
+            loaders["training_export"],
+            device,
+            class_weights,
+            circular_loss_function,
+            args,
+            collect_outputs=True,
+        )
+        selected_validation = run_epoch(
+            model,
+            loaders["validation"],
+            device,
+            class_weights,
+            circular_loss_function,
+            args,
+            collect_outputs=True,
+        )
+        testing = run_epoch(
+            model,
+            loaders["testing"],
+            device,
+            class_weights,
+            circular_loss_function,
+            args,
+            collect_outputs=True,
+        )
+
+    training_metrics = public_metrics(selected_training)
+    validation_metrics = public_metrics(selected_validation)
+    write_json(
+        os.path.join(run_dir, "validation_metrics.json"),
+        {
+            "selected_epoch": best_epoch,
+            **validation_metrics,
+        },
+    )
+    test_metrics = public_metrics(testing)
+    test_metrics.update(
+        final_classification_details(
+            testing["labels_array"],
+            testing["predictions_array"],
+        )
+    )
+    test_metrics["selected_epoch"] = best_epoch
+    write_json(
+        os.path.join(run_dir, "test_metrics.json"),
+        test_metrics,
+    )
+    write_rows(
+        os.path.join(run_dir, "test_predictions.csv"),
+        testing["prediction_rows"],
+    )
+    save_feature_npz(
+        os.path.join(run_dir, "features_train.npz"),
+        selected_training,
+    )
+    save_feature_npz(
+        os.path.join(run_dir, "features_valid.npz"),
+        selected_validation,
+    )
+    save_feature_npz(
+        os.path.join(run_dir, "features_test.npz"),
+        testing,
+    )
+
+    archive = {
+        "labels": testing["labels_array"],
+        "predictions": testing["predictions_array"],
+        "fusion_features": testing["fusion_features_array"],
+    }
+    if testing["embeddings_array"] is not None:
+        archive["embeddings"] = testing["embeddings_array"]
+    np.savez_compressed(
+        os.path.join(run_dir, "test_representations.npz"),
+        **archive
+    )
+
+    geometry_dir = os.path.join(run_dir, "geometry")
+    fusion_geometry = save_geometry_artifacts(
+        geometry_dir,
+        "fusion_features",
+        testing["fusion_features_array"],
+        testing["labels_array"],
+    )
+    projected_geometry = None
+    if testing["embeddings_array"] is not None:
+        projected_geometry = save_geometry_artifacts(
+            geometry_dir,
+            "embeddings",
+            testing["embeddings_array"],
+            testing["labels_array"],
+        )
+    summary = {
+        "experiment_mode": args.experiment_mode,
+        "seed": args.seed,
+        "circular_weight": args.circular_weight,
+        "selected_epoch": best_epoch,
+        "training": training_metrics,
+        "validation": validation_metrics,
+        "test": public_metrics(testing),
+        "fusion_geometry": fusion_geometry,
+        "projected_geometry": projected_geometry,
+        "run_directory": run_dir,
+    }
+    write_json(os.path.join(run_dir, "summary.json"), summary)
+    print(json.dumps(summary, indent=2, allow_nan=True))
+    return summary
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train SDT, SDT-cosine, or SDT-CSE with a fixed "
+            "train/validation/test split."
+        )
+    )
+    parser.add_argument(
+        "--experiment-mode",
+        choices=EXPERIMENT_MODES,
+        default="sdt_cse",
+    )
+    parser.add_argument("--feature-path", default=DEFAULT_FEATURE_PATH)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--n-head", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--embedding-dim", type=int, default=256)
+    parser.add_argument("--projection-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--initial-cosine-scale", type=float, default=16.0
+    )
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--fusion-ce-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--unimodal-ce-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--distillation-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--circular-weight", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--same-class-margin", type=float, default=0.0
+    )
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--validation-ratio", type=float, default=0.10)
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--text-dim", type=int, default=1024)
+    parser.add_argument("--visual-dim", type=int, default=342)
+    parser.add_argument("--audio-dim", type=int, default=1582)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+    )
+    parser.add_argument("--overwrite", action="store_true")
+    return parser
+
+
+def main():
+    args = build_argument_parser().parse_args()
+    try:
+        train_and_test(args)
+    except Exception as error:
+        print("ERROR: {}".format(error), file=sys.stderr)
+        raise
+
+
+if __name__ == "__main__":
+    main()
