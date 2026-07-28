@@ -220,6 +220,41 @@ Run all three CircularCSE architectures with NRC-VAD geometry over seeds
 GPU_ID=1 bash exec_iemocap_vad.sh
 ```
 
+## PCA visualization
+
+Visualize the pre-projection fused representation:
+
+```bash
+python visualize_multimodal_pca.py \
+  --path results/sdt_cse_lambda_0.1/seed_2024/features_test.npz \
+  --feature-key feature_fusion
+```
+
+Visualize the normalized embedding used by CircularCSE and the cosine
+classifier:
+
+```bash
+python visualize_multimodal_pca.py \
+  --path results/sdt_cse_lambda_0.1/seed_2024/features_test.npz \
+  --feature-key feature_embedding
+```
+
+Use `--dimensions 3 --show` for an interactive 3-D plot. By default, the
+command writes the PCA plot, emotion-centroid CSV, and reusable PCA-data NPZ
+to:
+
+```text
+pca_dimension/<condition>/<seed>/
+```
+
+For example:
+
+```text
+pca_dimension/sdt_cse_lambda_0.1/seed_2024/
+```
+
+Pass `--output-dir` only when a different destination is needed.
+
 Existing nonempty run directories are protected. Pass `--overwrite` only when
 you intentionally want to replace files for the same condition and seed.
 
