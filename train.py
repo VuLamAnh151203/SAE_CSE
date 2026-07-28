@@ -62,14 +62,27 @@ def set_random_seed(seed, use_cuda):
         torch.backends.cudnn.benchmark = False
 
 
-def resolve_device(device_name):
-    if device_name == "auto":
-        return torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-    if device_name == "cuda" and not torch.cuda.is_available():
+def resolve_device(device_name, gpu_id=0):
+    if gpu_id < 0:
+        raise ValueError("--gpu-id must be nonnegative")
+    use_cuda = device_name == "cuda" or (
+        device_name == "auto" and torch.cuda.is_available()
+    )
+    if not use_cuda:
+        if device_name == "cuda":
+            raise RuntimeError("CUDA was requested but is not available")
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
-    return torch.device(device_name)
+    device_count = torch.cuda.device_count()
+    if gpu_id >= device_count:
+        raise ValueError(
+            "--gpu-id {} is invalid; {} CUDA device(s) are visible".format(
+                gpu_id, device_count
+            )
+        )
+    torch.cuda.set_device(gpu_id)
+    return torch.device("cuda:{}".format(gpu_id))
 
 
 def move_batch_to_device(batch, device):
@@ -509,7 +522,7 @@ def validate_arguments(args):
 
 def train_and_test(args):
     validate_arguments(args)
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, args.gpu_id)
     set_random_seed(args.seed, device.type == "cuda")
     loaders = create_iemocap_loaders(
         feature_path=args.feature_path,
@@ -801,6 +814,15 @@ def build_argument_parser():
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=0,
+        help=(
+            "zero-based CUDA device index among visible GPUs "
+            "(default: 0)"
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser

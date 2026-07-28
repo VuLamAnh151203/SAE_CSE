@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/results_sweep"
+GPU_ID="${GPU_ID:-0}"
 
 for circular_weight in 0.01 0.05 0.1 0.5 1.0
 do
@@ -11,6 +12,8 @@ do
     echo "lambda=${circular_weight} seed=${seed}"
     python -u "${SCRIPT_DIR}/train.py" \
       --experiment-mode sdt_cse \
+      --device cuda \
+      --gpu-id "${GPU_ID}" \
       --circular-weight "${circular_weight}" \
       --seed "${seed}" \
       --epochs 150 \

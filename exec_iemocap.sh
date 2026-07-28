@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/results"
+GPU_ID="${GPU_ID:-0}"
 
 for mode in sdt sdt_cosine sdt_cse
 do
@@ -11,6 +12,8 @@ do
     echo "mode=${mode} seed=${seed}"
     python -u "${SCRIPT_DIR}/train.py" \
       --experiment-mode "${mode}" \
+      --device cuda \
+      --gpu-id "${GPU_ID}" \
       --seed "${seed}" \
       --epochs 150 \
       --batch-size 16 \

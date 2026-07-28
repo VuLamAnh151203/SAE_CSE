@@ -93,8 +93,20 @@ cd SDT-CSE
 python train.py \
   --experiment-mode sdt_cse \
   --circular-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
   --seed 2024
 ```
+
+Select another visible GPU by changing `--gpu-id`, for example:
+
+```bash
+python train.py --experiment-mode sdt_cse --device cuda --gpu-id 1
+```
+
+GPU IDs are zero-based indices among the devices visible to the process. If
+`CUDA_VISIBLE_DEVICES` is set, `--gpu-id 0` means the first GPU in that
+restricted list.
 
 Run the corresponding controls:
 
@@ -107,6 +119,12 @@ Run all three modes over ten initialization seeds and aggregate them:
 
 ```bash
 bash exec_iemocap.sh
+```
+
+For the launchers, select a GPU with the `GPU_ID` environment variable:
+
+```bash
+GPU_ID=1 bash exec_iemocap.sh
 ```
 
 Run the predefined CircularCSE sensitivity analysis:
