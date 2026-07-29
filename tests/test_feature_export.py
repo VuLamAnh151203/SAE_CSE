@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,7 +12,11 @@ PROJECT_DIR = os.path.dirname(TEST_DIR)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-from train import emotion_to_sentiment, save_feature_npz  # noqa: E402
+from train import (  # noqa: E402
+    emotion_to_sentiment,
+    save_empty_feature_npz,
+    save_feature_npz,
+)
 
 
 class FeatureExportTest(unittest.TestCase):
@@ -119,6 +124,23 @@ class FeatureExportTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     archive["feature_v_embedding"].shape, (2, 3)
+                )
+
+    def test_no_validation_protocol_writes_empty_schema(self):
+        model = SimpleNamespace(
+            hidden_dim=8,
+            embedding_dim=6,
+            fusion_projector=object(),
+            text_projector=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "features_valid.npz")
+            save_empty_feature_npz(path, model)
+            with np.load(path) as archive:
+                self.assertEqual(archive["labels_emo"].shape, (0,))
+                self.assertEqual(archive["feature_l"].shape, (0, 8))
+                self.assertEqual(
+                    archive["feature_embedding"].shape, (0, 6)
                 )
 
 

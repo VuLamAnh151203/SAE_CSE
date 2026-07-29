@@ -19,7 +19,11 @@ from sklearn.metrics import (
 )
 
 from analyze_geometry import save_geometry_artifacts
-from dataloader import DEFAULT_FEATURE_PATH, create_iemocap_loaders
+from dataloader import (
+    DEFAULT_FEATURE_PATH,
+    SELECTION_PROTOCOLS,
+    create_iemocap_loaders,
+)
 from losses import (
     CIRCULAR_GEOMETRIES,
     CircularCSELoss,
@@ -457,6 +461,49 @@ def save_feature_npz(path, result):
     return path
 
 
+def save_empty_feature_npz(path, model):
+    """Write a schema-compatible empty validation export."""
+    empty_int = np.empty((0,), dtype=np.int64)
+    empty_text = np.empty((0,), dtype=str)
+    export = {
+        "labels_emo": empty_int,
+        "preds_emo": empty_int.copy(),
+        "labels_sen": empty_int.copy(),
+        "preds_sen": empty_int.copy(),
+        "dialogue_ids": empty_text,
+        "utterance_indices": empty_int.copy(),
+        "utterance_ids": empty_text.copy(),
+        "sentences": empty_text.copy(),
+        "feature_l": np.empty(
+            (0, model.hidden_dim), dtype=np.float32
+        ),
+        "feature_v": np.empty(
+            (0, model.hidden_dim), dtype=np.float32
+        ),
+        "feature_a": np.empty(
+            (0, model.hidden_dim), dtype=np.float32
+        ),
+        "feature_fusion": np.empty(
+            (0, model.hidden_dim), dtype=np.float32
+        ),
+    }
+    if model.fusion_projector is not None:
+        export["feature_embedding"] = np.empty(
+            (0, model.embedding_dim), dtype=np.float32
+        )
+    if model.text_projector is not None:
+        for name in (
+            "feature_l_embedding",
+            "feature_a_embedding",
+            "feature_v_embedding",
+        ):
+            export[name] = np.empty(
+                (0, model.embedding_dim), dtype=np.float32
+            )
+    np.savez_compressed(path, **export)
+    return path
+
+
 def public_metrics(result):
     keys = list(LOSS_NAMES) + [
         "accuracy",
@@ -489,7 +536,9 @@ def write_epoch_metrics(path, rows):
     flattened = []
     for row in rows:
         item = {"epoch": row["epoch"], "seconds": row["seconds"]}
-        for split in ("training", "validation"):
+        for split in ("training", "validation", "testing"):
+            if split not in row:
+                continue
             for key, value in row[split].items():
                 item["{}_{}".format(split, key)] = value
         flattened.append(item)
@@ -510,30 +559,57 @@ def is_better_validation(
     return False
 
 
+def is_better_selection(
+    candidate_f1,
+    candidate_ce,
+    best_f1,
+    best_ce,
+    selection_protocol,
+    tolerance=1e-12,
+):
+    if selection_protocol == "test":
+        return (
+            round(candidate_f1, 2)
+            > round(best_f1, 2) + tolerance
+        )
+    return is_better_validation(
+        candidate_f1,
+        candidate_ce,
+        best_f1,
+        best_ce,
+        tolerance=tolerance,
+    )
+
+
 def experiment_directory_name(
     mode,
     circular_weight,
     circular_geometry="equal",
     angle_weight=0.0,
+    selection_protocol="validation",
 ):
     if mode in LEARNABLE_ANGLE_MODES:
-        return "{}_{}_lambda_{}_angle_{}".format(
+        condition = "{}_{}_lambda_{}_angle_{}".format(
             mode,
             circular_geometry,
             format(float(circular_weight), "g"),
             format(float(angle_weight), "g"),
         )
-    if mode in CIRCULAR_CSE_MODES:
+    elif mode in CIRCULAR_CSE_MODES:
         geometry_suffix = (
             "" if circular_geometry == "equal"
             else "_{}".format(circular_geometry)
         )
-        return "{}{}_lambda_{}".format(
+        condition = "{}{}_lambda_{}".format(
             mode,
             geometry_suffix,
             format(float(circular_weight), "g"),
         )
-    return mode
+    else:
+        condition = mode
+    if selection_protocol == "test":
+        condition += "_test_selected"
+    return condition
 
 
 def current_angle_state(model, fixed_class_angles):
@@ -677,7 +753,8 @@ def save_checkpoint(
     args,
     split_ids,
     epoch,
-    validation_metrics,
+    validation_metrics=None,
+    selection_metrics=None,
 ):
     angles = build_iemocap_angles(
         geometry=args.circular_geometry,
@@ -721,6 +798,17 @@ def save_checkpoint(
         "split_ids": split_ids,
         "selected_epoch": epoch,
         "validation_metrics": validation_metrics,
+        "selection_protocol": args.selection_protocol,
+        "selection_split": (
+            "testing"
+            if args.selection_protocol == "test"
+            else "validation"
+        ),
+        "selection_metrics": (
+            selection_metrics
+            if selection_metrics is not None
+            else validation_metrics
+        ),
     }
     torch.save(payload, path)
 
@@ -751,6 +839,12 @@ def validate_arguments(args):
         raise ValueError("--temperature must be positive")
     if args.embedding_dim < 2:
         raise ValueError("--embedding-dim must be at least 2")
+    if args.selection_protocol not in SELECTION_PROTOCOLS:
+        raise ValueError(
+            "--selection-protocol must be one of {}".format(
+                SELECTION_PROTOCOLS
+            )
+        )
     for name in (
         "fusion_ce_weight",
         "unimodal_ce_weight",
@@ -800,6 +894,7 @@ def train_and_test(args):
         validation_ratio=args.validation_ratio,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        selection_protocol=args.selection_protocol,
     )
 
     run_dir = os.path.join(
@@ -809,6 +904,7 @@ def train_and_test(args):
             args.circular_weight,
             args.circular_geometry,
             args.angle_weight,
+            args.selection_protocol,
         ),
         "seed_{}".format(args.seed),
     )
@@ -883,9 +979,15 @@ def train_and_test(args):
     best_f1 = -float("inf")
     best_ce = float("inf")
     best_epoch = None
-    best_validation = None
+    best_selection = None
     epoch_rows = []
     angle_history_rows = []
+    selection_name = (
+        "testing"
+        if args.selection_protocol == "test"
+        else "validation"
+    )
+    selection_loader = loaders[selection_name]
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
@@ -899,9 +1001,9 @@ def train_and_test(args):
             optimizer=optimizer,
         )
         with torch.no_grad():
-            validation = run_epoch(
+            selection = run_epoch(
                 model,
-                loaders["validation"],
+                selection_loader,
                 device,
                 class_weights,
                 circular_loss_function,
@@ -911,7 +1013,7 @@ def train_and_test(args):
             "epoch": epoch,
             "seconds": time.time() - started,
             "training": public_metrics(training),
-            "validation": public_metrics(validation),
+            selection_name: public_metrics(selection),
         }
         epoch_rows.append(row)
         write_epoch_metrics(
@@ -929,25 +1031,28 @@ def train_and_test(args):
             )
         print(
             "epoch={} train_total={:.6f} train_wf1={:.4f} "
-            "valid_total={:.6f} valid_wf1={:.4f}".format(
+            "{}_total={:.6f} {}_wf1={:.4f}".format(
                 epoch,
                 training["total_loss"],
                 training["weighted_f1"],
-                validation["total_loss"],
-                validation["weighted_f1"],
+                selection_name,
+                selection["total_loss"],
+                selection_name,
+                selection["weighted_f1"],
             ),
             flush=True,
         )
-        if is_better_validation(
-            validation["weighted_f1"],
-            validation["fusion_ce"],
+        if is_better_selection(
+            selection["weighted_f1"],
+            selection["fusion_ce"],
             best_f1,
             best_ce,
+            args.selection_protocol,
         ):
-            best_f1 = validation["weighted_f1"]
-            best_ce = validation["fusion_ce"]
+            best_f1 = selection["weighted_f1"]
+            best_ce = selection["fusion_ce"]
             best_epoch = epoch
-            best_validation = public_metrics(validation)
+            best_selection = public_metrics(selection)
             save_checkpoint(
                 best_path,
                 model,
@@ -955,7 +1060,12 @@ def train_and_test(args):
                 args,
                 loaders["split_ids"],
                 epoch,
-                best_validation,
+                validation_metrics=(
+                    best_selection
+                    if args.selection_protocol == "validation"
+                    else None
+                ),
+                selection_metrics=best_selection,
             )
 
     checkpoint = torch.load(best_path, map_location=device)
@@ -995,14 +1105,18 @@ def train_and_test(args):
             args,
             collect_outputs=True,
         )
-        selected_validation = run_epoch(
-            model,
-            loaders["validation"],
-            device,
-            class_weights,
-            circular_loss_function,
-            args,
-            collect_outputs=True,
+        selected_validation = (
+            run_epoch(
+                model,
+                loaders["validation"],
+                device,
+                class_weights,
+                circular_loss_function,
+                args,
+                collect_outputs=True,
+            )
+            if loaders["validation"] is not None
+            else None
         )
         testing = run_epoch(
             model,
@@ -1015,13 +1129,25 @@ def train_and_test(args):
         )
 
     training_metrics = public_metrics(selected_training)
-    validation_metrics = public_metrics(selected_validation)
+    validation_metrics = (
+        public_metrics(selected_validation)
+        if selected_validation is not None
+        else None
+    )
+    validation_report = {
+        "selected_epoch": best_epoch,
+        "available": selected_validation is not None,
+    }
+    if validation_metrics is None:
+        validation_report["reason"] = (
+            "selection_protocol=test uses all trainVid for training "
+            "and has no validation split"
+        )
+    else:
+        validation_report.update(validation_metrics)
     write_json(
         os.path.join(run_dir, "validation_metrics.json"),
-        {
-            "selected_epoch": best_epoch,
-            **validation_metrics,
-        },
+        validation_report,
     )
     test_metrics = public_metrics(testing)
     test_metrics.update(
@@ -1043,10 +1169,16 @@ def train_and_test(args):
         os.path.join(run_dir, "features_train.npz"),
         selected_training,
     )
-    save_feature_npz(
-        os.path.join(run_dir, "features_valid.npz"),
-        selected_validation,
-    )
+    if selected_validation is None:
+        save_empty_feature_npz(
+            os.path.join(run_dir, "features_valid.npz"),
+            model,
+        )
+    else:
+        save_feature_npz(
+            os.path.join(run_dir, "features_valid.npz"),
+            selected_validation,
+        )
     save_feature_npz(
         os.path.join(run_dir, "features_test.npz"),
         testing,
@@ -1106,6 +1238,9 @@ def train_and_test(args):
             )
     summary = {
         "experiment_mode": args.experiment_mode,
+        "selection_protocol": args.selection_protocol,
+        "selection_split": selection_name,
+        "selection_metrics": best_selection,
         "seed": args.seed,
         "circular_weight": args.circular_weight,
         "angle_weight": args.angle_weight,
@@ -1215,6 +1350,16 @@ def build_argument_parser():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--validation-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--selection-protocol",
+        choices=SELECTION_PROTOCOLS,
+        default="validation",
+        help=(
+            "validation selects on the first validation-ratio of "
+            "trainVid; test reproduces original SDT by training on "
+            "all trainVid and selecting on test weighted F1 every epoch"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--text-dim", type=int, default=1024)
     parser.add_argument("--visual-dim", type=int, default=342)

@@ -35,13 +35,13 @@ def condition_name(summary):
     mode = summary["experiment_mode"]
     if mode == "sdt_cse_learnable_angles":
         geometry = summary.get("circular_geometry", "nrc_vad")
-        return "{}_{}_lambda_{}_angle_{}".format(
+        condition = "{}_{}_lambda_{}_angle_{}".format(
             mode,
             geometry,
             format(float(summary["circular_weight"]), "g"),
             format(float(summary.get("angle_weight", 0.1)), "g"),
         )
-    if mode in (
+    elif mode in (
         "sdt_cse",
         "sdt_cse_all_cosine",
         "sdt_cse_fusion_only",
@@ -51,12 +51,16 @@ def condition_name(summary):
             "" if geometry == "equal"
             else "_{}".format(geometry)
         )
-        return "{}{}_lambda_{}".format(
+        condition = "{}{}_lambda_{}".format(
             mode,
             geometry_suffix,
             format(float(summary["circular_weight"]), "g"),
         )
-    return mode
+    else:
+        condition = mode
+    if summary.get("selection_protocol", "validation") == "test":
+        condition += "_test_selected"
+    return condition
 
 
 def aggregate(output_dir):

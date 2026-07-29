@@ -65,6 +65,23 @@ fusion CE as the tie-breaker. The test loader is evaluated only once, after
 the selected checkpoint has been restored. Validation data is not folded back
 into training.
 
+An explicit original-SDT-style protocol is also available:
+
+```bash
+--selection-protocol test
+```
+
+It trains on every `trainVid` dialogue, creates no validation split, evaluates
+`testVid` after every epoch, and selects the earliest epoch attaining the
+highest test weighted F1 after rounding to two decimals, matching the original
+SDT selection code. This protocol uses test information for model selection
+and therefore produces test-selected, optimistically biased estimates. It is
+provided only for direct behavioral comparison with the original SDT
+launcher. Its result directory ends in `_test_selected`.
+Unlike the original script, this implementation saves and restores the
+test-selected checkpoint so its predictions and embeddings correspond to the
+reported selected epoch.
+
 ## Objective
 
 For all modes with unimodal classifiers, the preserved SDT objective is:
@@ -249,6 +266,30 @@ python train.py --experiment-mode sdt_cse_fusion_only --seed 2024
 python train.py --experiment-mode sdt_cse_learnable_angles --seed 2024
 ```
 
+Run standard SDT-CSE with the original SDT test-selection behavior:
+
+```bash
+python train.py \
+  --experiment-mode sdt_cse \
+  --selection-protocol test \
+  --epochs 150 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
+This writes to:
+
+```text
+results/sdt_cse_lambda_0.1_test_selected/seed_2024/
+```
+
+Run that protocol over seeds 2024-2033:
+
+```bash
+GPU_ID=0 bash exec_iemocap_test_selected.sh
+```
+
 Run all six modes over ten initialization seeds and aggregate them:
 
 ```bash
@@ -328,14 +369,19 @@ Each run is written below `SDT-CSE/results/<condition>/seed_<seed>/` and
 contains:
 
 - the complete configuration and exact split IDs;
-- epoch-level training and validation metrics;
-- the best validation checkpoint;
-- final validation and single-pass test metrics;
+- epoch-level training and selection-split metrics;
+- the selected checkpoint and its selection protocol;
+- final metrics and representations from the restored checkpoint;
 - utterance-level test predictions;
 - `features_train.npz`, `features_valid.npz`, and `features_test.npz`;
 - fused and projected test representations;
 - target, observed, and error similarity matrices;
 - heatmaps and deterministic PCA plots.
+
+For `--selection-protocol test`, `features_train.npz` covers all of
+`trainVid`, while `features_valid.npz` is a schema-compatible empty archive
+because no validation set exists. `features_test.npz` contains the restored
+test-selected checkpoint's test representations.
 
 Learnable-angle runs additionally contain:
 

@@ -563,6 +563,13 @@ class LearnableCircularAnglesTest(unittest.TestCase):
             checkpoint["circle_order"], list(CIRCLE_ORDER)
         )
         self.assertEqual(checkpoint["angle_weight"], 0.1)
+        self.assertEqual(
+            checkpoint["selection_protocol"], "validation"
+        )
+        self.assertEqual(checkpoint["selection_split"], "validation")
+        self.assertEqual(
+            checkpoint["selection_metrics"]["weighted_f1"], 70.0
+        )
         self.assertEqual(len(checkpoint["raw_gaps"]), 6)
         self.assertEqual(len(checkpoint["angle_gaps"]), 6)
         self.assertEqual(len(checkpoint["class_angles"]), 6)

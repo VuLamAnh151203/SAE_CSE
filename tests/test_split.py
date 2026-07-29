@@ -8,10 +8,15 @@ PROJECT_DIR = os.path.dirname(TEST_DIR)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-from dataloader import fixed_train_validation_test_split  # noqa: E402
+from dataloader import (  # noqa: E402
+    fixed_train_validation_test_split,
+    original_test_selection_split,
+)
+from aggregate_results import condition_name  # noqa: E402
 from train import (  # noqa: E402
     build_argument_parser,
     experiment_directory_name,
+    is_better_selection,
     is_better_validation,
     validate_arguments,
 )
@@ -46,6 +51,38 @@ class FixedSplitTest(unittest.TestCase):
         self.assertTrue(is_better_validation(70.0, 0.4, 70.0, 0.5))
         self.assertFalse(is_better_validation(70.0, 0.6, 70.0, 0.5))
 
+    def test_original_test_protocol_uses_all_training_dialogues(self):
+        train_ids = ["train_0", "train_1", "train_2"]
+        test_ids = ["test_0", "test_1"]
+        splits = original_test_selection_split(train_ids, test_ids)
+        self.assertEqual(splits["training"], train_ids)
+        self.assertEqual(splits["validation"], [])
+        self.assertEqual(splits["testing"], test_ids)
+        self.assertFalse(
+            set(splits["training"]) & set(splits["testing"])
+        )
+
+    def test_test_selection_uses_strict_f1_and_keeps_earlier_ties(self):
+        self.assertTrue(
+            is_better_selection(
+                70.0, 2.0, 69.0, 1.0, selection_protocol="test"
+            )
+        )
+        self.assertFalse(
+            is_better_selection(
+                70.0, 0.1, 70.0, 1.0, selection_protocol="test"
+            )
+        )
+        self.assertFalse(
+            is_better_selection(
+                70.004,
+                0.1,
+                70.001,
+                1.0,
+                selection_protocol="test",
+            )
+        )
+
     def test_nonuniform_geometry_has_an_independent_run_directory(self):
         self.assertEqual(
             experiment_directory_name("sdt_cse", 0.1, "equal"),
@@ -67,6 +104,16 @@ class FixedSplitTest(unittest.TestCase):
                 "lambda_0.1_angle_0.1"
             ),
         )
+        self.assertEqual(
+            experiment_directory_name(
+                "sdt_cse",
+                0.1,
+                "equal",
+                0.0,
+                "test",
+            ),
+            "sdt_cse_lambda_0.1_test_selected",
+        )
 
     def test_learnable_mode_uses_nrc_default_and_fixed_modes_do_not(self):
         parser = build_argument_parser()
@@ -83,6 +130,18 @@ class FixedSplitTest(unittest.TestCase):
         validate_arguments(fixed)
         self.assertEqual(fixed.circular_geometry, "equal")
         self.assertEqual(fixed.angle_weight, 0.0)
+
+    def test_aggregation_separates_test_selected_results(self):
+        summary = {
+            "experiment_mode": "sdt_cse",
+            "circular_geometry": "equal",
+            "circular_weight": 0.1,
+            "selection_protocol": "test",
+        }
+        self.assertEqual(
+            condition_name(summary),
+            "sdt_cse_lambda_0.1_test_selected",
+        )
 
 
 if __name__ == "__main__":

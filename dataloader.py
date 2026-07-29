@@ -17,6 +17,7 @@ DEFAULT_FEATURE_PATH = os.path.abspath(
         "iemocap_multimodal_features.pkl",
     )
 )
+SELECTION_PROTOCOLS = ("validation", "test")
 
 
 def fixed_train_validation_test_split(
@@ -61,6 +62,27 @@ def fixed_train_validation_test_split(
     return {
         "training": training_keys,
         "validation": validation_keys,
+        "testing": testing_keys,
+    }
+
+
+def original_test_selection_split(train_vids, test_vids):
+    """Reproduce SDT's all-train/test-selection dataset membership."""
+    training_keys = list(train_vids)
+    testing_keys = list(test_vids)
+    if not training_keys:
+        raise ValueError("training split is empty")
+    if not testing_keys:
+        raise ValueError("testing split is empty")
+    if len(set(training_keys)) != len(training_keys):
+        raise ValueError("training dialogue IDs contain duplicates")
+    if len(set(testing_keys)) != len(testing_keys):
+        raise ValueError("testing dialogue IDs contain duplicates")
+    if set(training_keys) & set(testing_keys):
+        raise ValueError("training and testing sets overlap")
+    return {
+        "training": training_keys,
+        "validation": [],
         "testing": testing_keys,
     }
 
@@ -212,15 +234,28 @@ def create_iemocap_loaders(
     validation_ratio=0.10,
     num_workers=0,
     pin_memory=False,
+    selection_protocol="validation",
 ):
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if selection_protocol not in SELECTION_PROTOCOLS:
+        raise ValueError(
+            "selection_protocol must be one of {}".format(
+                SELECTION_PROTOCOLS
+            )
+        )
     dataset = IEMOCAPDataset(feature_path)
-    split_ids = fixed_train_validation_test_split(
-        dataset.trainVid,
-        dataset.testVid,
-        validation_ratio=validation_ratio,
-    )
+    if selection_protocol == "validation":
+        split_ids = fixed_train_validation_test_split(
+            dataset.trainVid,
+            dataset.testVid,
+            validation_ratio=validation_ratio,
+        )
+    else:
+        split_ids = original_test_selection_split(
+            dataset.trainVid,
+            dataset.testVid,
+        )
 
     split_indices = {
         split: [dataset.key_to_index[key] for key in keys]
@@ -242,13 +277,17 @@ def create_iemocap_loaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-    validation = DataLoader(
-        Subset(dataset, split_indices["validation"]),
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=dataset.collate_fn,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+    validation = (
+        DataLoader(
+            Subset(dataset, split_indices["validation"]),
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=dataset.collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if split_indices["validation"]
+        else None
     )
     testing = DataLoader(
         Subset(dataset, split_indices["testing"]),
