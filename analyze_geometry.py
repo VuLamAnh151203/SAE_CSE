@@ -242,6 +242,11 @@ def main():
     parser.add_argument(
         "--vad-center-arousal", type=float, default=0.5
     )
+    parser.add_argument(
+        "--minimum-confusion-gap-degrees",
+        type=float,
+        default=75.0,
+    )
     args = parser.parse_args()
     archive = np.load(args.npz)
     if args.representation not in archive:
@@ -258,6 +263,9 @@ def main():
             vad_center=(
                 args.vad_center_valence,
                 args.vad_center_arousal,
+            ),
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
             ),
         ),
     )

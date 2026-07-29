@@ -98,6 +98,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse_fusion_only",
             "sdt_cse_learnable_angles",
             "sdt_cse_learnable_angles_confusion_gap",
+            "sdt_cse_confusion_margin",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
@@ -127,6 +128,10 @@ class ModelModeTest(unittest.TestCase):
                 self.assertIsNone(model.cosine_classifier)
             else:
                 self.assertEqual(outputs["embeddings"].shape, (2, 4, 6))
+                self.assertEqual(
+                    outputs["fusion_cosine_scores"].shape,
+                    (2, 4, 6),
+                )
                 norms = outputs["embeddings"].norm(p=2, dim=-1)
                 self.assertTrue(
                     torch.allclose(norms, torch.ones_like(norms), atol=1e-6)
@@ -216,6 +221,10 @@ class ModelModeTest(unittest.TestCase):
                 self.assertIsNone(outputs["angle_gaps"])
                 self.assertIsNone(outputs["angle_offsets"])
                 self.assertIsNone(outputs["angle_regularization"])
+            self.assertEqual(
+                outputs["confusion_margin_enabled"],
+                mode == "sdt_cse_confusion_margin",
+            )
 
     def test_cse_gradients_reach_encoder_and_unimodal_heads(self):
         model = make_model("sdt_cse")
@@ -236,6 +245,65 @@ class ModelModeTest(unittest.TestCase):
         self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
         self.assertIsNotNone(model.cosine_classifier.class_weights.grad)
         self.assertIsNotNone(model.t_output_layer[-1].weight.grad)
+
+    def test_confusion_margin_mode_adds_direct_cosine_margin(self):
+        prior = build_iemocap_angles(
+            geometry="confusion_separated"
+        )
+        model = make_model(
+            "sdt_cse_confusion_margin",
+            initial_class_angles=prior,
+        )
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 4, 3, 5], [1, 2, 0, 0]])
+        common = {
+            "outputs": outputs,
+            "labels": labels,
+            "utterance_mask": inputs[3],
+            "class_weights": iemocap_class_weights(),
+            "circular_loss_function": CircularCSELoss(
+                class_angles=prior,
+                confusion_pair_weight=5.0,
+            ),
+            "circular_weight": 0.1,
+            "confusion_classification_margin": 2.0,
+        }
+        without_margin = compute_sdt_cse_losses(
+            confusion_classification_weight=0.0,
+            **common
+        )
+        with_margin = compute_sdt_cse_losses(
+            confusion_classification_weight=0.1,
+            **common
+        )
+        self.assertGreater(
+            float(
+                with_margin["confusion_classification_margin"]
+            ),
+            0.0,
+        )
+        self.assertTrue(
+            torch.allclose(
+                with_margin["total_loss"],
+                without_margin["total_loss"]
+                + 0.1
+                * with_margin[
+                    "confusion_classification_margin"
+                ],
+            )
+        )
+        with_margin["confusion_classification_margin"].backward()
+        self.assertGreater(
+            float(model.fusion_projector.linear_1.weight.grad.abs().sum()),
+            0.0,
+        )
+        self.assertGreater(
+            float(
+                model.cosine_classifier.class_weights.grad.abs().sum()
+            ),
+            0.0,
+        )
 
     def test_all_cosine_mode_preserves_cse_and_distillation_gradients(self):
         model = make_model("sdt_cse_all_cosine")

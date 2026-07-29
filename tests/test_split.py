@@ -137,6 +137,28 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_confusion_margin",
+                0.1,
+                "confusion_separated",
+                0.0,
+                "validation",
+                "standard",
+                0.1,
+                0.1,
+                75.0,
+                0.0,
+                5.0,
+                0.1,
+                0.1,
+            ),
+            (
+                "sdt_cse_confusion_margin_confusion_separated_"
+                "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
+                "clsweight_0.1"
+            ),
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse",
                 0.1,
                 "equal",
@@ -197,6 +219,26 @@ class FixedSplitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_arguments(invalid_prior)
 
+        confusion_margin = parser.parse_args(
+            ["--experiment-mode", "sdt_cse_confusion_margin"]
+        )
+        validate_arguments(confusion_margin)
+        self.assertEqual(
+            confusion_margin.circular_geometry,
+            "confusion_separated",
+        )
+        self.assertEqual(
+            confusion_margin.confused_cse_pair_weight, 5.0
+        )
+        self.assertEqual(
+            confusion_margin.confusion_classification_margin, 0.1
+        )
+        self.assertEqual(
+            confusion_margin.confusion_classification_weight, 0.1
+        )
+        self.assertEqual(confusion_margin.angle_weight, 0.0)
+        self.assertEqual(confusion_margin.confusion_gap_weight, 0.0)
+
         fixed = parser.parse_args(
             ["--experiment-mode", "sdt_cse"]
         )
@@ -204,6 +246,10 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(fixed.circular_geometry, "equal")
         self.assertEqual(fixed.angle_weight, 0.0)
         self.assertEqual(fixed.confusion_gap_weight, 0.0)
+        self.assertEqual(fixed.confused_cse_pair_weight, 1.0)
+        self.assertEqual(
+            fixed.confusion_classification_weight, 0.0
+        )
         self.assertEqual(fixed.sdt_residual_update, "standard")
 
     def test_aggregation_separates_test_selected_results(self):
@@ -240,6 +286,25 @@ class FixedSplitTest(unittest.TestCase):
                 "sdt_cse_learnable_angles_confusion_gap_equal_"
                 "lambda_0.1_angle_0.1_mingap_75_gap_1_"
                 "test_selected"
+            ),
+        )
+        confusion_margin = dict(summary)
+        confusion_margin.update(
+            {
+                "experiment_mode": "sdt_cse_confusion_margin",
+                "circular_geometry": "confusion_separated",
+                "minimum_confusion_gap_degrees": 75.0,
+                "confused_cse_pair_weight": 5.0,
+                "confusion_classification_margin": 0.1,
+                "confusion_classification_weight": 0.1,
+            }
+        )
+        self.assertEqual(
+            condition_name(confusion_margin),
+            (
+                "sdt_cse_confusion_margin_confusion_separated_"
+                "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_test_selected"
             ),
         )
 

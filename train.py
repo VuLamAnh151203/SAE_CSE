@@ -43,6 +43,7 @@ from model import (
     CIRCLE_ORDER,
     CIRCULAR_CSE_MODES,
     CONFUSION_GAP_MODES,
+    CONFUSION_MARGIN_MODES,
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
     LEARNABLE_ANGLE_MODES,
@@ -75,6 +76,7 @@ LOSS_NAMES = (
     "total_circular_cse",
     "angle_regularization",
     "confusion_gap_regularization",
+    "confusion_classification_margin",
 )
 CONFUSION_PAIR_NAMES = (
     ("happy_excited", 0, 4),
@@ -289,6 +291,12 @@ def run_epoch(
                 confusion_gap_weight=args.confusion_gap_weight,
                 minimum_confusion_gap_degrees=(
                     args.minimum_confusion_gap_degrees
+                ),
+                confusion_classification_weight=(
+                    args.confusion_classification_weight
+                ),
+                confusion_classification_margin=(
+                    args.confusion_classification_margin
                 ),
             )
             if training:
@@ -702,8 +710,24 @@ def experiment_directory_name(
     spherical_mlp_alpha_init=0.1,
     minimum_confusion_gap_degrees=75.0,
     confusion_gap_weight=0.0,
+    confused_cse_pair_weight=1.0,
+    confusion_classification_margin=0.1,
+    confusion_classification_weight=0.0,
 ):
-    if mode in CONFUSION_GAP_MODES:
+    if mode in CONFUSION_MARGIN_MODES:
+        condition = (
+            "{}_{}_lambda_{}_mingap_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}"
+        ).format(
+            mode,
+            circular_geometry,
+            format(float(circular_weight), "g"),
+            format(float(minimum_confusion_gap_degrees), "g"),
+            format(float(confused_cse_pair_weight), "g"),
+            format(float(confusion_classification_margin), "g"),
+            format(float(confusion_classification_weight), "g"),
+        )
+    elif mode in CONFUSION_GAP_MODES:
         condition = (
             "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
         ).format(
@@ -986,6 +1010,9 @@ def save_checkpoint(
             args.vad_center_valence,
             args.vad_center_arousal,
         ),
+        minimum_confusion_gap_degrees=(
+            args.minimum_confusion_gap_degrees
+        ),
     )
     angle_payload = angle_state_payload(model, angles)
     gap_payload = confusion_gap_payload(
@@ -1010,6 +1037,13 @@ def save_checkpoint(
         "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
+        "confused_cse_pair_weight": args.confused_cse_pair_weight,
+        "confusion_classification_margin": (
+            args.confusion_classification_margin
+        ),
+        "confusion_classification_weight": (
+            args.confusion_classification_weight
+        ),
         **gap_payload,
         "circle_order": angle_payload["circle_order"],
         "prior_class_angles": angle_payload[
@@ -1108,6 +1142,7 @@ def validate_arguments(args):
         "circular_weight",
         "angle_weight",
         "confusion_gap_weight",
+        "confusion_classification_weight",
         "same_class_margin",
     ):
         if getattr(args, name) < 0:
@@ -1123,12 +1158,30 @@ def validate_arguments(args):
             "--minimum-confusion-gap-degrees must be finite and "
             "in (0, 180]"
         )
+    if (
+        not np.isfinite(args.confused_cse_pair_weight)
+        or args.confused_cse_pair_weight < 1.0
+    ):
+        raise ValueError(
+            "--confused-cse-pair-weight must be finite and at least 1"
+        )
+    if (
+        not np.isfinite(args.confusion_classification_margin)
+        or args.confusion_classification_margin < 0.0
+        or args.confusion_classification_margin > 2.0
+    ):
+        raise ValueError(
+            "--confusion-classification-margin must be finite and "
+            "in [0, 2]"
+        )
     if not np.isfinite(args.vad_center_valence):
         raise ValueError("--vad-center-valence must be finite")
     if not np.isfinite(args.vad_center_arousal):
         raise ValueError("--vad-center-arousal must be finite")
     if args.circular_geometry is None:
-        if args.experiment_mode in CONFUSION_GAP_MODES:
+        if args.experiment_mode in CONFUSION_MARGIN_MODES:
+            args.circular_geometry = "confusion_separated"
+        elif args.experiment_mode in CONFUSION_GAP_MODES:
             args.circular_geometry = "equal"
         elif args.experiment_mode in LEARNABLE_ANGLE_MODES:
             args.circular_geometry = "nrc_vad"
@@ -1141,6 +1194,22 @@ def validate_arguments(args):
         raise ValueError(
             "confusion-gap mode requires --circular-geometry equal"
         )
+    if (
+        args.experiment_mode in CONFUSION_MARGIN_MODES
+        and args.circular_geometry != "confusion_separated"
+    ):
+        raise ValueError(
+            "confusion-margin mode requires "
+            "--circular-geometry confusion_separated"
+        )
+    if (
+        args.experiment_mode in CONFUSION_MARGIN_MODES
+        and args.minimum_confusion_gap_degrees >= 180.0
+    ):
+        raise ValueError(
+            "confusion-margin mode requires "
+            "--minimum-confusion-gap-degrees below 180"
+        )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
         args.circular_geometry = "equal"
@@ -1150,6 +1219,9 @@ def validate_arguments(args):
             args.vad_center_valence,
             args.vad_center_arousal,
         ),
+        minimum_confusion_gap_degrees=(
+            args.minimum_confusion_gap_degrees
+        ),
     )
     if args.experiment_mode in FUSION_ONLY_MODES:
         args.unimodal_ce_weight = 0.0
@@ -1158,6 +1230,9 @@ def validate_arguments(args):
         args.angle_weight = 0.0
     if args.experiment_mode not in CONFUSION_GAP_MODES:
         args.confusion_gap_weight = 0.0
+    if args.experiment_mode not in CONFUSION_MARGIN_MODES:
+        args.confused_cse_pair_weight = 1.0
+        args.confusion_classification_weight = 0.0
 
 
 def train_and_test(args):
@@ -1186,6 +1261,9 @@ def train_and_test(args):
             args.spherical_mlp_alpha_init,
             args.minimum_confusion_gap_degrees,
             args.confusion_gap_weight,
+            args.confused_cse_pair_weight,
+            args.confusion_classification_margin,
+            args.confusion_classification_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1208,6 +1286,9 @@ def train_and_test(args):
         vad_center=(
             args.vad_center_valence,
             args.vad_center_arousal,
+        ),
+        minimum_confusion_gap_degrees=(
+            args.minimum_confusion_gap_degrees
         ),
     )
     model = SDTCSEModel(
@@ -1245,6 +1326,15 @@ def train_and_test(args):
             "geometry": args.circular_geometry,
             "angle_weight": args.angle_weight,
             "confusion_gap_weight": args.confusion_gap_weight,
+            "confused_cse_pair_weight": (
+                args.confused_cse_pair_weight
+            ),
+            "confusion_classification_margin": (
+                args.confusion_classification_margin
+            ),
+            "confusion_classification_weight": (
+                args.confusion_classification_weight
+            ),
             **initial_gap_payload,
             "vad_center": [
                 args.vad_center_valence,
@@ -1258,6 +1348,7 @@ def train_and_test(args):
         CircularCSELoss(
             class_angles=prior_class_angles,
             same_class_margin=args.same_class_margin,
+            confusion_pair_weight=args.confused_cse_pair_weight,
         ).to(device)
         if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
@@ -1619,6 +1710,13 @@ def train_and_test(args):
         "circular_weight": args.circular_weight,
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
+        "confused_cse_pair_weight": args.confused_cse_pair_weight,
+        "confusion_classification_margin": (
+            args.confusion_classification_margin
+        ),
+        "confusion_classification_weight": (
+            args.confusion_classification_weight
+        ),
         **selected_gap_payload,
         "circular_geometry": args.circular_geometry,
         "vad_center": [
@@ -1742,6 +1840,34 @@ def build_argument_parser():
         ),
     )
     parser.add_argument(
+        "--confused-cse-pair-weight",
+        type=float,
+        default=5.0,
+        help=(
+            "relative CircularCSE weight for happy-excited and "
+            "angry-frustrated ordered pairs in confusion-margin "
+            "mode (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--confusion-classification-margin",
+        type=float,
+        default=0.1,
+        help=(
+            "required true-minus-confused raw cosine-score margin "
+            "in confusion-margin mode (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--confusion-classification-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "weight for the direct confusion-aware cosine "
+            "classification margin (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--same-class-margin", type=float, default=0.0
     )
     parser.add_argument(
@@ -1750,9 +1876,12 @@ def build_argument_parser():
         default=None,
         help=(
             "equal uses the original six equally spaced angles; "
-            "nrc_vad derives nonuniform angles from NRC-VAD anchors. "
+            "nrc_vad derives nonuniform angles from NRC-VAD anchors; "
+            "confusion_separated fixes happy-excited and "
+            "angry-frustrated at the requested minimum gap and "
+            "balances the other four gaps. "
             "Defaults to nrc_vad for sdt_cse_learnable_angles and "
-            "equal for confusion-gap and fixed-angle modes"
+            "confusion_separated for confusion-margin mode"
         ),
     )
     parser.add_argument(

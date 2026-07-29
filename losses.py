@@ -26,7 +26,11 @@ IEMOCAP_CLASS_FREQUENCIES = (
     0.127711,
     0.252668,
 )
-CIRCULAR_GEOMETRIES = ("equal", "nrc_vad")
+CIRCULAR_GEOMETRIES = (
+    "equal",
+    "nrc_vad",
+    "confusion_separated",
+)
 NRC_VAD_ANCHORS = (
     (0.960, 0.732),  # happy
     (0.052, 0.288),  # sad
@@ -50,6 +54,7 @@ def build_iemocap_angles(
     dtype=torch.float32,
     geometry="equal",
     vad_center=(0.5, 0.5),
+    minimum_confusion_gap_degrees=75.0,
 ):
     if geometry not in CIRCULAR_GEOMETRIES:
         raise ValueError(
@@ -68,6 +73,50 @@ def build_iemocap_angles(
             device=device,
             dtype=dtype,
         )
+    if geometry == "confusion_separated":
+        minimum_gap = float(minimum_confusion_gap_degrees)
+        if (
+            not math.isfinite(minimum_gap)
+            or minimum_gap <= 0.0
+            or minimum_gap >= 180.0
+        ):
+            raise ValueError(
+                "minimum_confusion_gap_degrees must be finite and "
+                "in (0, 180) for confusion-separated geometry"
+            )
+        remaining_gap = (360.0 - 2.0 * minimum_gap) / 4.0
+        if remaining_gap <= 0.0:
+            raise ValueError(
+                "confusion-separated geometry requires positive "
+                "non-confusion gaps"
+            )
+        # Circular order: happy, excited, angry, frustrated, sad,
+        # neutral. The two predefined confusion gaps are fixed to the
+        # requested value and the remaining circumference is balanced.
+        ordered_degrees = torch.tensor(
+            [
+                0.0,
+                minimum_gap,
+                minimum_gap + remaining_gap,
+                2.0 * minimum_gap + remaining_gap,
+                2.0 * minimum_gap + 2.0 * remaining_gap,
+                2.0 * minimum_gap + 3.0 * remaining_gap,
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        circle_order = torch.tensor(
+            [0, 4, 3, 5, 1, 2],
+            device=device,
+            dtype=torch.long,
+        )
+        angles = torch.empty(
+            6,
+            device=device,
+            dtype=dtype,
+        )
+        angles[circle_order] = torch.deg2rad(ordered_degrees)
+        return angles
 
     center = torch.as_tensor(
         vad_center,
@@ -212,16 +261,106 @@ def masked_self_distillation_kl(
     return F.kl_div(student, teacher, reduction="sum") / valid.sum().float()
 
 
+def masked_confusion_classification_margin(
+    cosine_scores,
+    labels,
+    mask,
+    margin=0.1,
+    pairs=IEMOCAP_CONFUSION_PAIRS,
+):
+    """Require the true cosine score to exceed a confused competitor."""
+    margin = float(margin)
+    if not math.isfinite(margin) or margin < 0.0 or margin > 2.0:
+        raise ValueError("margin must be finite and in [0, 2]")
+    valid_scores, valid_labels, _ = _valid_flattened(
+        cosine_scores,
+        labels,
+        mask,
+    )
+    if not pairs:
+        raise ValueError("pairs must not be empty")
+    competitor_by_class = {}
+    for first_id, second_id in pairs:
+        first_id = int(first_id)
+        second_id = int(second_id)
+        if first_id == second_id:
+            raise ValueError(
+                "confusion pairs must contain different classes"
+            )
+        if (
+            first_id in competitor_by_class
+            or second_id in competitor_by_class
+        ):
+            raise ValueError(
+                "each class may occur in at most one confusion pair"
+            )
+        competitor_by_class[first_id] = second_id
+        competitor_by_class[second_id] = first_id
+    if competitor_by_class:
+        minimum_id = min(competitor_by_class)
+        maximum_id = max(competitor_by_class)
+        if minimum_id < 0 or maximum_id >= cosine_scores.size(-1):
+            raise ValueError(
+                "confusion pair class ID exceeds cosine scores"
+            )
+
+    selected = torch.zeros_like(valid_labels, dtype=torch.bool)
+    competitors = torch.zeros_like(valid_labels)
+    for class_id, competitor_id in competitor_by_class.items():
+        class_selected = valid_labels.eq(class_id)
+        selected = selected | class_selected
+        competitors[class_selected] = competitor_id
+    if selected.sum().item() == 0:
+        return cosine_scores.sum() * 0.0
+
+    selected_scores = valid_scores[selected]
+    selected_labels = valid_labels[selected]
+    selected_competitors = competitors[selected]
+    row_ids = torch.arange(
+        selected_scores.size(0),
+        device=selected_scores.device,
+    )
+    true_scores = selected_scores[row_ids, selected_labels]
+    competing_scores = selected_scores[
+        row_ids, selected_competitors
+    ]
+    return F.relu(
+        true_scores.new_tensor(margin)
+        - (true_scores - competing_scores)
+    ).mean()
+
+
 class CircularCSELoss(nn.Module):
-    def __init__(self, class_angles=None, same_class_margin=0.0):
+    def __init__(
+        self,
+        class_angles=None,
+        same_class_margin=0.0,
+        confusion_pair_weight=1.0,
+        confusion_pairs=IEMOCAP_CONFUSION_PAIRS,
+    ):
         super().__init__()
         if same_class_margin < 0:
             raise ValueError("same_class_margin must be nonnegative")
+        confusion_pair_weight = float(confusion_pair_weight)
+        if (
+            not math.isfinite(confusion_pair_weight)
+            or confusion_pair_weight < 1.0
+        ):
+            raise ValueError(
+                "confusion_pair_weight must be finite and at least 1"
+            )
+        if not confusion_pairs:
+            raise ValueError("confusion_pairs must not be empty")
         if class_angles is None:
             class_angles = build_iemocap_angles()
         if class_angles.ndim != 1:
             raise ValueError("class_angles must be one-dimensional")
         self.same_class_margin = float(same_class_margin)
+        self.confusion_pair_weight = confusion_pair_weight
+        self.confusion_pairs = tuple(
+            (int(first_id), int(second_id))
+            for first_id, second_id in confusion_pairs
+        )
         self.register_buffer(
             "class_angles", class_angles.detach().clone()
         )
@@ -291,7 +430,30 @@ class CircularCSELoss(nn.Module):
         pairwise = torch.where(
             same_class, same_loss, different_loss
         )
-        return pairwise[off_diagonal].mean()
+        if self.confusion_pair_weight == 1.0:
+            return pairwise[off_diagonal].mean()
+
+        pair_weights = torch.ones_like(pairwise)
+        for first_id, second_id in self.confusion_pairs:
+            selected_pair = (
+                labels[:, None].eq(first_id)
+                & labels[None, :].eq(second_id)
+            ) | (
+                labels[:, None].eq(second_id)
+                & labels[None, :].eq(first_id)
+            )
+            pair_weights = torch.where(
+                selected_pair,
+                pair_weights.new_tensor(
+                    self.confusion_pair_weight
+                ),
+                pair_weights,
+            )
+        valid_losses = pairwise[off_diagonal]
+        valid_weights = pair_weights[off_diagonal]
+        return (
+            valid_losses * valid_weights
+        ).sum() / valid_weights.sum()
 
 
 def compute_sdt_cse_losses(
@@ -308,6 +470,8 @@ def compute_sdt_cse_losses(
     angle_weight=0.0,
     confusion_gap_weight=0.0,
     minimum_confusion_gap_degrees=75.0,
+    confusion_classification_weight=0.0,
+    confusion_classification_margin=0.1,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
@@ -316,6 +480,9 @@ def compute_sdt_cse_losses(
         "circular_weight": circular_weight,
         "angle_weight": angle_weight,
         "confusion_gap_weight": confusion_gap_weight,
+        "confusion_classification_weight": (
+            confusion_classification_weight
+        ),
     }.items():
         if value < 0:
             raise ValueError("{} must be nonnegative".format(name))
@@ -472,6 +639,28 @@ def compute_sdt_cse_losses(
         raise ValueError(
             "positive confusion_gap_weight requires confusion-gap mode"
         )
+    confusion_classification = (
+        outputs["fusion_logits"].sum() * 0.0
+    )
+    if outputs.get("confusion_margin_enabled", False):
+        cosine_scores = outputs.get("fusion_cosine_scores")
+        if cosine_scores is None:
+            raise ValueError(
+                "confusion-margin mode requires fusion cosine scores"
+            )
+        confusion_classification = (
+            masked_confusion_classification_margin(
+                cosine_scores,
+                labels,
+                utterance_mask,
+                margin=confusion_classification_margin,
+            )
+        )
+    elif confusion_classification_weight > 0:
+        raise ValueError(
+            "positive confusion_classification_weight requires "
+            "confusion-margin mode"
+        )
     total = (
         fusion_ce_weight * fusion_ce
         + unimodal_ce_weight * unimodal_ce
@@ -479,6 +668,8 @@ def compute_sdt_cse_losses(
         + circular_weight * total_circular
         + angle_weight * angle_regularization
         + confusion_gap_weight * confusion_gap_regularization
+        + confusion_classification_weight
+        * confusion_classification
     )
     return {
         "total_loss": total,
@@ -501,5 +692,8 @@ def compute_sdt_cse_losses(
         "angle_regularization": angle_regularization,
         "confusion_gap_regularization": (
             confusion_gap_regularization
+        ),
+        "confusion_classification_margin": (
+            confusion_classification
         ),
     }

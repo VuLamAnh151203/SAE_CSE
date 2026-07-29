@@ -21,6 +21,7 @@ METRICS = (
     "total_circular_cse",
     "angle_regularization",
     "confusion_gap_regularization",
+    "confusion_classification_margin",
     "happy_excited_pair_macro_f1",
     "happy_excited_pair_weighted_f1",
     "happy_excited_mutual_confusion_rate",
@@ -45,7 +46,48 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse_learnable_angles_confusion_gap":
+    if mode == "sdt_cse_confusion_margin":
+        condition = (
+            "{}_{}_lambda_{}_mingap_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}"
+        ).format(
+            mode,
+            summary.get(
+                "circular_geometry", "confusion_separated"
+            ),
+            format(float(summary["circular_weight"]), "g"),
+            format(
+                float(
+                    summary.get(
+                        "minimum_confusion_gap_degrees", 75.0
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get("confused_cse_pair_weight", 5.0)
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_margin", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_weight", 0.1
+                    )
+                ),
+                "g",
+            ),
+        )
+    elif mode == "sdt_cse_learnable_angles_confusion_gap":
         geometry = summary.get("circular_geometry", "equal")
         condition = (
             "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
@@ -80,6 +122,7 @@ def condition_name(summary):
         "sdt_cse_all_cosine",
         "sdt_cse_all_modal_cse",
         "sdt_cse_fusion_only",
+        "sdt_cse_confusion_margin",
     ):
         geometry = summary.get("circular_geometry", "equal")
         geometry_suffix = (

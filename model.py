@@ -14,6 +14,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_confusion_margin",
 )
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
@@ -22,6 +23,7 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_confusion_margin",
 )
 ALL_COSINE_MODES = (
     "sdt_cse_all_cosine",
@@ -32,6 +34,7 @@ FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
 CONFUSION_GAP_MODES = (
     "sdt_cse_learnable_angles_confusion_gap",
 )
+CONFUSION_MARGIN_MODES = ("sdt_cse_confusion_margin",)
 LEARNABLE_ANGLE_MODES = (
     "sdt_cse_learnable_angles",
     *CONFUSION_GAP_MODES,
@@ -649,14 +652,15 @@ class CosineEmotionClassifier(nn.Module):
     def effective_scale(self):
         return self.log_scale.exp().clamp(min=1.0, max=100.0)
 
-    def forward(self, embeddings):
+    def cosine_scores(self, embeddings):
         embeddings = F.normalize(embeddings, p=2, dim=-1, eps=1e-8)
         class_weights = F.normalize(
             self.class_weights, p=2, dim=-1, eps=1e-8
         )
-        return self.effective_scale * torch.matmul(
-            embeddings, class_weights.t()
-        )
+        return torch.matmul(embeddings, class_weights.t())
+
+    def forward(self, embeddings):
+        return self.effective_scale * self.cosine_scores(embeddings)
 
 
 class SDTCSEModel(nn.Module):
@@ -1062,11 +1066,18 @@ class SDTCSEModel(nn.Module):
         fusion_features = representations["fusion_features"]
 
         embeddings = None
+        fusion_cosine_scores = None
         if self.experiment_mode == "sdt":
             fusion_logits = self.all_output_layer(fusion_features)
         else:
             embeddings = self.fusion_projector(fusion_features)
-            fusion_logits = self.cosine_classifier(embeddings)
+            fusion_cosine_scores = (
+                self.cosine_classifier.cosine_scores(embeddings)
+            )
+            fusion_logits = (
+                self.cosine_classifier.effective_scale
+                * fusion_cosine_scores
+            )
 
         text_embeddings = None
         audio_embeddings = None
@@ -1107,7 +1118,11 @@ class SDTCSEModel(nn.Module):
             "confusion_gap_enabled": (
                 self.experiment_mode in CONFUSION_GAP_MODES
             ),
+            "confusion_margin_enabled": (
+                self.experiment_mode in CONFUSION_MARGIN_MODES
+            ),
             "fusion_logits": fusion_logits,
+            "fusion_cosine_scores": fusion_cosine_scores,
             "text_logits": text_logits,
             "audio_logits": audio_logits,
             "visual_logits": visual_logits,

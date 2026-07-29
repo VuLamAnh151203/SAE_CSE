@@ -19,12 +19,70 @@ from losses import (  # noqa: E402
     circular_pair_distances,
     compute_sdt_cse_losses,
     iemocap_class_weights,
+    masked_confusion_classification_margin,
     masked_self_distillation_kl,
     minimum_confusion_gap_regularization,
 )
 
 
 class CircularCSELossTest(unittest.TestCase):
+    def test_confusion_separated_geometry_has_exact_balanced_gaps(self):
+        angles = build_iemocap_angles(
+            geometry="confusion_separated",
+            minimum_confusion_gap_degrees=75.0,
+        )
+        expected_degrees = torch.tensor(
+            [0.0, 255.0, 307.5, 127.5, 75.0, 202.5]
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.rad2deg(angles),
+                expected_degrees,
+                atol=1e-5,
+            )
+        )
+        confusion_gaps = torch.rad2deg(
+            circular_pair_distances(angles)
+        )
+        self.assertTrue(
+            torch.allclose(
+                confusion_gaps,
+                torch.tensor([75.0, 75.0]),
+                atol=1e-5,
+            )
+        )
+
+    def test_weighted_circular_cse_uses_weighted_ordered_mean(self):
+        angles = build_iemocap_angles(
+            geometry="confusion_separated"
+        )
+        embeddings = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+        )
+        labels = torch.tensor([0, 4, 1])
+        criterion = CircularCSELoss(
+            class_angles=angles,
+            confusion_pair_weight=5.0,
+        )
+        actual = criterion(embeddings, labels)
+
+        predicted = embeddings @ embeddings.t()
+        target_table = build_target_similarity(angles)
+        target = target_table[labels[:, None], labels[None, :]]
+        pairwise = (predicted - target).pow(2)
+        off_diagonal = ~torch.eye(3, dtype=torch.bool)
+        weights = torch.ones(3, 3)
+        confused = (
+            labels[:, None].eq(0) & labels[None, :].eq(4)
+        ) | (
+            labels[:, None].eq(4) & labels[None, :].eq(0)
+        )
+        weights[confused] = 5.0
+        expected = (
+            pairwise[off_diagonal] * weights[off_diagonal]
+        ).sum() / weights[off_diagonal].sum()
+        self.assertTrue(torch.allclose(actual, expected))
+
     def test_confusion_gap_penalty_uses_requested_minimum(self):
         equal_angles = build_iemocap_angles(geometry="equal")
         distances = torch.rad2deg(
@@ -193,6 +251,34 @@ class CircularCSELossTest(unittest.TestCase):
 
 
 class SelfDistillationLossTest(unittest.TestCase):
+    def test_confusion_classification_margin_masks_and_targets_pairs(self):
+        scores = torch.zeros(1, 6, 6, requires_grad=True)
+        with torch.no_grad():
+            scores[0, 0, 0] = 0.20
+            scores[0, 0, 4] = 0.15
+            scores[0, 1, 4] = 0.40
+            scores[0, 1, 0] = 0.10
+            scores[0, 2, 3] = 0.00
+            scores[0, 2, 5] = 0.20
+            scores[0, 3, 5] = 0.50
+            scores[0, 3, 3] = 0.45
+            scores[0, 4, 1] = -1.00
+            scores[0, 5, 0] = -1.00
+            scores[0, 5, 4] = 1.00
+        labels = torch.tensor([[0, 4, 3, 5, 1, 0]])
+        mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0]])
+        loss = masked_confusion_classification_margin(
+            scores,
+            labels,
+            mask,
+            margin=0.1,
+        )
+        self.assertAlmostEqual(float(loss), 0.1, places=6)
+        loss.backward()
+        self.assertGreater(float(scores.grad[0, :4].abs().sum()), 0.0)
+        self.assertEqual(float(scores.grad[0, 4].abs().sum()), 0.0)
+        self.assertEqual(float(scores.grad[0, 5].abs().sum()), 0.0)
+
     def _outputs(self):
         return {
             "fusion_logits": torch.randn(2, 3, 6, requires_grad=True),

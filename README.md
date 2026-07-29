@@ -18,6 +18,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
 | `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
+| `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -51,6 +52,10 @@ The comparisons have distinct purposes:
 - `sdt_cse_learnable_angles_confusion_gap - sdt_cse_learnable_angles`
   measures whether explicitly widening happy–excited and
   angry–frustrated improves their classification.
+
+- `sdt_cse_confusion_margin - sdt_cse` measures the combined effect of a
+  fixed constrained geometry, stronger CircularCSE supervision for the two
+  confused pairs, and a direct confusion-aware cosine-classification margin.
 
 ## Internal spherical residuals
 
@@ -200,6 +205,35 @@ The ordered positive-gap parameterization remains unchanged, so the circular
 order and total circumference are preserved. Increasing these two gaps
 redistributes the remaining circumference across the other four gaps.
 
+For `sdt_cse_confusion_margin`, the class angles are fixed rather than
+learned. In circular order, the six consecutive gaps are:
+
+```text
+[75, 52.5, 75, 52.5, 52.5, 52.5] degrees
+```
+
+The first and third gaps are happy-to-excited and angry-to-frustrated.
+`--confused-cse-pair-weight` applies symmetrically to every ordered
+cross-class CircularCSE pair belonging to either confused pair. The weighted
+mean is normalized by the sum of pair weights.
+
+The mode also adds a direct raw-cosine classification constraint:
+
+```text
+confusion_classification_weight * mean(
+  relu(
+    confusion_classification_margin
+    - (true_class_cosine - confused_class_cosine)
+  )
+)
+```
+
+Only gold happy, excited, angry, and frustrated utterances enter this term.
+It directly updates the projected fusion embedding and cosine classifier
+weights. Defaults are pair weight `5`, cosine margin `0.1`, and
+classification-margin weight `0.1`. Original unimodal CE and
+self-distillation remain active.
+
 The emotion order is:
 
 ```text
@@ -224,9 +258,13 @@ architecture:
 - `equal` is the original equally spaced six-emotion circle.
 - `nrc_vad` derives non-equally spaced angles from fixed NRC-VAD valence and
   arousal anchors around a configurable affect-space center.
+- `confusion_separated` fixes the two predefined confusion gaps to
+  `--minimum-confusion-gap-degrees` and divides the remaining circumference
+  equally over the other four positive gaps.
 
 Fixed-angle modes default to `equal`. The learnable-angle mode defaults to
-`nrc_vad`; either prior can be selected explicitly.
+`nrc_vad`; either prior can be selected explicitly. The
+`sdt_cse_confusion_margin` mode requires `confusion_separated`.
 
 The nonuniform version uses:
 
@@ -374,6 +412,18 @@ python train.py \
   --minimum-confusion-gap-degrees 75 \
   --confusion-gap-weight 0.1 \
   --seed 2024
+python train.py \
+  --experiment-mode sdt_cse_confusion_margin \
+  --selection-protocol validation \
+  --circular-geometry confusion_separated \
+  --minimum-confusion-gap-degrees 75 \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
 ```
 
 Run standard SDT-CSE with the original SDT test-selection behavior:
@@ -443,6 +493,16 @@ internal spherical residuals:
 GPU_ID=0 RESIDUAL_UPDATE=spherical \
   bash exec_iemocap_confusion_gap_sweep.sh
 ```
+
+Run the recommended validation-selected confusion-margin sweep with
+`confused_cse_pair_weight in {2, 5, 10}`:
+
+```bash
+GPU_ID=0 bash exec_iemocap_confusion_margin_sweep.sh
+```
+
+It uses the fixed 75-degree geometry, classification margin `0.1`,
+classification-margin weight `0.1`, and standard SDT residual updates.
 
 Run all experiment modes over ten initialization seeds and aggregate them:
 
@@ -557,6 +617,11 @@ angry–frustrated gaps, minimum gap, gap penalty, and gap weight in the
 checkpoint, angle history, learned geometry, and summary. Every experiment
 reports separate pair macro/weighted F1 and direct mutual-confusion rates for
 both predefined pairs.
+
+Confusion-margin runs record the fixed angles, exact pair gaps, target
+similarity matrix, confused-pair CSE weight, cosine-classification margin,
+classification-margin weight, and independently logged
+`confusion_classification_margin` loss in checkpoints and summaries.
 
 The three `features_*.npz` files follow the established
 `results/alv_IEMOCAP_20260630_054819/features_train.npz` contract:
