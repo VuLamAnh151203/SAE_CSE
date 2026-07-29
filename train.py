@@ -62,6 +62,12 @@ LOSS_NAMES = (
     "visual_kl",
     "distillation",
     "circular_cse",
+    "fusion_circular_cse",
+    "text_circular_cse",
+    "audio_circular_cse",
+    "visual_circular_cse",
+    "unimodal_circular_cse",
+    "total_circular_cse",
     "angle_regularization",
 )
 

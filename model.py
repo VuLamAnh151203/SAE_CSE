@@ -10,15 +10,22 @@ EXPERIMENT_MODES = (
     "sdt_cosine",
     "sdt_cse",
     "sdt_cse_all_cosine",
+    "sdt_cse_all_modal_cse",
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
 )
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
     "sdt_cse_all_cosine",
+    "sdt_cse_all_modal_cse",
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
 )
+ALL_COSINE_MODES = (
+    "sdt_cse_all_cosine",
+    "sdt_cse_all_modal_cse",
+)
+ALL_MODAL_CSE_MODES = ("sdt_cse_all_modal_cse",)
 FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
 LEARNABLE_ANGLE_MODES = ("sdt_cse_learnable_angles",)
 CIRCLE_ORDER = (0, 4, 3, 5, 1, 2)
@@ -842,7 +849,7 @@ class SDTCSEModel(nn.Module):
         self.text_projector = None
         self.audio_projector = None
         self.visual_projector = None
-        if experiment_mode == "sdt_cse_all_cosine":
+        if experiment_mode in ALL_COSINE_MODES:
             self.text_projector = SphericalFusionHead(
                 hidden_dim,
                 embedding_dim=embedding_dim,
@@ -1056,7 +1063,7 @@ class SDTCSEModel(nn.Module):
         text_embeddings = None
         audio_embeddings = None
         visual_embeddings = None
-        if self.experiment_mode == "sdt_cse_all_cosine":
+        if self.experiment_mode in ALL_COSINE_MODES:
             text_embeddings = self.text_projector(text_hidden)
             audio_embeddings = self.audio_projector(audio_hidden)
             visual_embeddings = self.visual_projector(visual_hidden)
@@ -1086,6 +1093,9 @@ class SDTCSEModel(nn.Module):
             "text_embeddings": text_embeddings,
             "audio_embeddings": audio_embeddings,
             "visual_embeddings": visual_embeddings,
+            "unimodal_circular_cse_enabled": (
+                self.experiment_mode in ALL_MODAL_CSE_MODES
+            ),
             "fusion_logits": fusion_logits,
             "text_logits": text_logits,
             "audio_logits": audio_logits,
@@ -1152,7 +1162,7 @@ class SDTCSEModel(nn.Module):
 
     @property
     def effective_unimodal_cosine_scales(self):
-        if self.experiment_mode != "sdt_cse_all_cosine":
+        if self.experiment_mode not in ALL_COSINE_MODES:
             return {
                 "text": None,
                 "audio": None,

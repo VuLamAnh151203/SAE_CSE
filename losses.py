@@ -318,7 +318,11 @@ def compute_sdt_cse_losses(
         audio_kl = zero
         visual_kl = zero
 
-    circular = outputs["fusion_logits"].sum() * 0.0
+    circular_zero = outputs["fusion_logits"].sum() * 0.0
+    fusion_circular = circular_zero
+    text_circular = circular_zero
+    audio_circular = circular_zero
+    visual_circular = circular_zero
     if circular_weight > 0:
         if circular_loss_function is None:
             raise ValueError(
@@ -333,14 +337,49 @@ def compute_sdt_cse_losses(
             -1, outputs["embeddings"].size(-1)
         )[valid]
         valid_labels = labels.reshape(-1)[valid]
-        circular = circular_loss_function(
+        fusion_circular = circular_loss_function(
             valid_embeddings,
             valid_labels,
             class_angles=outputs.get("class_angles"),
         )
+        if outputs.get("unimodal_circular_cse_enabled", False):
+            modality_embeddings = (
+                outputs.get("text_embeddings"),
+                outputs.get("audio_embeddings"),
+                outputs.get("visual_embeddings"),
+            )
+            if not all(
+                embeddings is not None
+                for embeddings in modality_embeddings
+            ):
+                raise ValueError(
+                    "all-modal CircularCSE requires projected text, "
+                    "audio, and visual embeddings"
+                )
+            modality_losses = []
+            for embeddings in modality_embeddings:
+                flattened = embeddings.reshape(
+                    -1, embeddings.size(-1)
+                )[valid]
+                modality_losses.append(
+                    circular_loss_function(
+                        flattened,
+                        valid_labels,
+                        class_angles=outputs.get("class_angles"),
+                    )
+                )
+            (
+                text_circular,
+                audio_circular,
+                visual_circular,
+            ) = modality_losses
 
     unimodal_ce = text_ce + audio_ce + visual_ce
     distillation = text_kl + audio_kl + visual_kl
+    unimodal_circular = (
+        text_circular + audio_circular + visual_circular
+    )
+    total_circular = fusion_circular + unimodal_circular
     angle_regularization = outputs["fusion_logits"].sum() * 0.0
     if outputs.get("angle_regularization") is not None:
         angle_regularization = outputs["angle_regularization"]
@@ -352,7 +391,7 @@ def compute_sdt_cse_losses(
         fusion_ce_weight * fusion_ce
         + unimodal_ce_weight * unimodal_ce
         + distillation_weight * distillation
-        + circular_weight * circular
+        + circular_weight * total_circular
         + angle_weight * angle_regularization
     )
     return {
@@ -366,6 +405,12 @@ def compute_sdt_cse_losses(
         "audio_kl": audio_kl,
         "visual_kl": visual_kl,
         "distillation": distillation,
-        "circular_cse": circular,
+        "circular_cse": fusion_circular,
+        "fusion_circular_cse": fusion_circular,
+        "text_circular_cse": text_circular,
+        "audio_circular_cse": audio_circular,
+        "visual_circular_cse": visual_circular,
+        "unimodal_circular_cse": unimodal_circular,
+        "total_circular_cse": total_circular,
         "angle_regularization": angle_regularization,
     }

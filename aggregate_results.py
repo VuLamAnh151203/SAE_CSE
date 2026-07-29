@@ -14,6 +14,11 @@ METRICS = (
     "macro_recall",
     "fusion_ce",
     "circular_cse",
+    "text_circular_cse",
+    "audio_circular_cse",
+    "visual_circular_cse",
+    "unimodal_circular_cse",
+    "total_circular_cse",
     "angle_regularization",
 )
 
@@ -44,6 +49,7 @@ def condition_name(summary):
     elif mode in (
         "sdt_cse",
         "sdt_cse_all_cosine",
+        "sdt_cse_all_modal_cse",
         "sdt_cse_fusion_only",
     ):
         geometry = summary.get("circular_geometry", "equal")

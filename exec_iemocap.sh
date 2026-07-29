@@ -10,6 +10,7 @@ for mode in \
   sdt_cosine \
   sdt_cse \
   sdt_cse_all_cosine \
+  sdt_cse_all_modal_cse \
   sdt_cse_fusion_only \
   sdt_cse_learnable_angles
 do

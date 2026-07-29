@@ -92,6 +92,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cosine",
             "sdt_cse",
             "sdt_cse_all_cosine",
+            "sdt_cse_all_modal_cse",
             "sdt_cse_fusion_only",
             "sdt_cse_learnable_angles",
         ):
@@ -133,7 +134,10 @@ class ModelModeTest(unittest.TestCase):
                 self.assertLessEqual(
                     float(model.effective_cosine_scale), 100.0
                 )
-            if mode == "sdt_cse_all_cosine":
+            if mode in (
+                "sdt_cse_all_cosine",
+                "sdt_cse_all_modal_cse",
+            ):
                 self.assertIsInstance(
                     model.t_output_layer, CosineEmotionClassifier
                 )
@@ -173,6 +177,10 @@ class ModelModeTest(unittest.TestCase):
                 ):
                     self.assertGreaterEqual(float(scale), 1.0)
                     self.assertLessEqual(float(scale), 100.0)
+                self.assertEqual(
+                    outputs["unimodal_circular_cse_enabled"],
+                    mode == "sdt_cse_all_modal_cse",
+                )
             else:
                 self.assertTrue(
                     all(
@@ -239,6 +247,19 @@ class ModelModeTest(unittest.TestCase):
         losses["total_loss"].backward()
 
         self.assertGreater(float(losses["circular_cse"]), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                losses["total_circular_cse"],
+                losses["circular_cse"],
+            )
+        )
+        for name in (
+            "text_circular_cse",
+            "audio_circular_cse",
+            "visual_circular_cse",
+            "unimodal_circular_cse",
+        ):
+            self.assertEqual(float(losses[name]), 0.0)
         self.assertGreaterEqual(float(losses["distillation"]), 0.0)
         self.assertIsNotNone(model.textf_input.weight.grad)
         self.assertIsNotNone(model.last_gate.fc.weight.grad)
@@ -254,6 +275,61 @@ class ModelModeTest(unittest.TestCase):
             self.assertIsNotNone(projector.linear_2.weight.grad)
             self.assertIsNotNone(classifier.class_weights.grad)
             self.assertIsNotNone(classifier.log_scale.grad)
+
+    def test_all_modal_cse_applies_circular_loss_to_four_embeddings(self):
+        model = make_model("sdt_cse_all_modal_cse")
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+        )
+        expected_circular = (
+            losses["fusion_circular_cse"]
+            + losses["text_circular_cse"]
+            + losses["audio_circular_cse"]
+            + losses["visual_circular_cse"]
+        )
+        expected_total = (
+            losses["fusion_ce"]
+            + losses["unimodal_ce"]
+            + losses["distillation"]
+            + 0.1 * expected_circular
+        )
+        self.assertTrue(
+            torch.allclose(
+                losses["total_circular_cse"],
+                expected_circular,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(losses["total_loss"], expected_total)
+        )
+        for name in (
+            "fusion_circular_cse",
+            "text_circular_cse",
+            "audio_circular_cse",
+            "visual_circular_cse",
+        ):
+            self.assertGreater(float(losses[name]), 0.0)
+
+        losses["total_circular_cse"].backward()
+        for projector in (
+            model.fusion_projector,
+            model.text_projector,
+            model.audio_projector,
+            model.visual_projector,
+        ):
+            self.assertIsNotNone(projector.linear_1.weight.grad)
+            self.assertGreater(
+                float(projector.linear_1.weight.grad.abs().sum()),
+                0.0,
+            )
 
     def test_fusion_only_mode_has_no_unimodal_losses_or_parameters(self):
         model = make_model("sdt_cse_fusion_only")

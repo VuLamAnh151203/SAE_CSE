@@ -97,6 +97,14 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_all_modal_cse",
+                0.1,
+                "equal",
+            ),
+            "sdt_cse_all_modal_cse_lambda_0.1",
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse_learnable_angles",
                 0.1,
                 "nrc_vad",
@@ -162,6 +170,12 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(
             condition_name(summary),
             "sdt_cse_lambda_0.1_test_selected",
+        )
+        all_modal = dict(summary)
+        all_modal["experiment_mode"] = "sdt_cse_all_modal_cse"
+        self.assertEqual(
+            condition_name(all_modal),
+            "sdt_cse_all_modal_cse_lambda_0.1_test_selected",
         )
 
         spherical = dict(summary)

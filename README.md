@@ -14,6 +14,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cosine` | Spherical projection + cosine | Original linear | Yes | No |
 | `sdt_cse` | Spherical projection + cosine | Original linear | Yes | Yes |
 | `sdt_cse_all_cosine` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Yes |
+| `sdt_cse_all_modal_cse` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Fusion + all three modalities |
 | `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
 | `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 
@@ -29,6 +30,9 @@ Linear(H,H) -> GELU -> Dropout -> Linear(H,embedding_dim)
 The four heads have independent projection parameters, normalized class
 weights, and learnable scales. The fused classifier remains the
 self-distillation teacher for all three branches in every mode.
+`sdt_cse_all_modal_cse` uses the identical four-head architecture and adds
+CircularCSE independently to the fusion, text, audio, and visual projected
+embeddings.
 
 The comparisons have distinct purposes:
 
@@ -37,6 +41,8 @@ The comparisons have distinct purposes:
 - `sdt_cse - sdt` measures the complete proposed model change.
 - `sdt_cse_all_cosine - sdt_cse` isolates replacing the three original
   unimodal classifiers with cosine classifiers.
+- `sdt_cse_all_modal_cse - sdt_cse_all_cosine` isolates applying
+  CircularCSE to the three unimodal projected embeddings.
 - `sdt_cse_fusion_only - sdt_cse` measures the contribution of the three
   unimodal CE losses and self-distillation branches.
 - `sdt_cse_learnable_angles - sdt_cse` isolates learning ordered class
@@ -138,6 +144,26 @@ For `sdt_cse` and `sdt_cse_all_cosine`, the complete objective is:
 ```text
 SDT objective + circular_weight * CircularCSE
 ```
+
+For `sdt_cse_all_modal_cse`, the objective is:
+
+```text
+SDT objective
++ circular_weight * (
+    CircularCSE(fusion_embedding)
+    + CircularCSE(text_embedding)
+    + CircularCSE(audio_embedding)
+    + CircularCSE(visual_embedding)
+  )
+```
+
+The four CircularCSE terms share the selected fixed circular geometry and
+same-class margin but are calculated independently.
+They are logged as `fusion_circular_cse`, `text_circular_cse`,
+`audio_circular_cse`, and `visual_circular_cse`.
+`unimodal_circular_cse` is the sum of the three modality terms and
+`total_circular_cse` is the sum of all four. The legacy `circular_cse`
+field remains the fusion term for compatibility.
 
 For `sdt_cse_fusion_only`, the encoders and hierarchical fusion are
 unchanged, but no unimodal classifiers are constructed. Its objective is:
@@ -321,6 +347,7 @@ Run the corresponding controls:
 python train.py --experiment-mode sdt --seed 2024
 python train.py --experiment-mode sdt_cosine --seed 2024
 python train.py --experiment-mode sdt_cse_all_cosine --seed 2024
+python train.py --experiment-mode sdt_cse_all_modal_cse --seed 2024
 python train.py --experiment-mode sdt_cse_fusion_only --seed 2024
 python train.py --experiment-mode sdt_cse_learnable_angles --seed 2024
 ```
@@ -501,10 +528,11 @@ feature_fusion
 All non-`sdt` modes also add `feature_embedding`, containing the normalized
 fusion projection used by their fusion cosine classifier and, in CircularCSE
 modes, by CircularCSE.
-`sdt_cse_all_cosine` additionally stores `feature_l_embedding`,
-`feature_a_embedding`, and `feature_v_embedding`, which are the normalized
-text, audio, and visual projections used by their respective cosine
-classifiers.
+`sdt_cse_all_cosine` and `sdt_cse_all_modal_cse` additionally store
+`feature_l_embedding`, `feature_a_embedding`, and `feature_v_embedding`,
+which are the normalized text, audio, and visual projections used by their
+respective cosine classifiers. In `sdt_cse_all_modal_cse`, these three
+projected embeddings also receive their own CircularCSE terms.
 `feature_l`, `feature_v`, and `feature_a` are SDT's final text-, visual-, and
 audio-oriented representations immediately before their unimodal
 classifiers. `feature_fusion` is the final hierarchical gated fusion

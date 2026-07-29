@@ -201,6 +201,76 @@ class SelfDistillationLossTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(first, second))
 
+    def test_all_modal_circular_loss_masks_padding_and_reaches_embeddings(
+        self,
+    ):
+        outputs = self._outputs()
+        outputs["unimodal_circular_cse_enabled"] = True
+        for name in (
+            "text_embeddings",
+            "audio_embeddings",
+            "visual_embeddings",
+        ):
+            outputs[name] = torch.randn(
+                2, 3, 8, requires_grad=True
+            )
+        labels = torch.tensor([[0, 1, 2], [3, 4, 0]])
+        mask = torch.tensor(
+            [[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]]
+        )
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            mask,
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+        )
+        expected = (
+            losses["fusion_circular_cse"]
+            + losses["text_circular_cse"]
+            + losses["audio_circular_cse"]
+            + losses["visual_circular_cse"]
+        )
+        self.assertTrue(
+            torch.allclose(losses["total_circular_cse"], expected)
+        )
+        self.assertTrue(
+            torch.allclose(
+                losses["unimodal_circular_cse"],
+                losses["text_circular_cse"]
+                + losses["audio_circular_cse"]
+                + losses["visual_circular_cse"],
+            )
+        )
+        losses["total_circular_cse"].backward()
+        for name in (
+            "embeddings",
+            "text_embeddings",
+            "audio_embeddings",
+            "visual_embeddings",
+        ):
+            gradient = outputs[name].grad
+            self.assertIsNotNone(gradient)
+            self.assertGreater(float(gradient.abs().sum()), 0.0)
+            self.assertEqual(float(gradient[1, 2].abs().sum()), 0.0)
+
+    def test_all_modal_circular_loss_requires_every_projection(self):
+        outputs = self._outputs()
+        outputs["unimodal_circular_cse_enabled"] = True
+        outputs["text_embeddings"] = torch.randn(2, 3, 8)
+        outputs["audio_embeddings"] = torch.randn(2, 3, 8)
+        outputs["visual_embeddings"] = None
+        with self.assertRaises(ValueError):
+            compute_sdt_cse_losses(
+                outputs,
+                torch.tensor([[0, 1, 2], [3, 4, 0]]),
+                torch.ones(2, 3),
+                iemocap_class_weights(),
+                circular_loss_function=CircularCSELoss(),
+                circular_weight=0.1,
+            )
+
     def test_fusion_only_outputs_skip_unimodal_ce_and_kl(self):
         outputs = self._outputs()
         outputs["text_logits"] = None
