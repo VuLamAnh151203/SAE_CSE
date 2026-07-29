@@ -13,6 +13,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_all_modal_cse",
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
+    "sdt_cse_learnable_angles_confusion_gap",
 )
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
@@ -20,6 +21,7 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_all_modal_cse",
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
+    "sdt_cse_learnable_angles_confusion_gap",
 )
 ALL_COSINE_MODES = (
     "sdt_cse_all_cosine",
@@ -27,7 +29,13 @@ ALL_COSINE_MODES = (
 )
 ALL_MODAL_CSE_MODES = ("sdt_cse_all_modal_cse",)
 FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
-LEARNABLE_ANGLE_MODES = ("sdt_cse_learnable_angles",)
+CONFUSION_GAP_MODES = (
+    "sdt_cse_learnable_angles_confusion_gap",
+)
+LEARNABLE_ANGLE_MODES = (
+    "sdt_cse_learnable_angles",
+    *CONFUSION_GAP_MODES,
+)
 CIRCLE_ORDER = (0, 4, 3, 5, 1, 2)
 SDT_RESIDUAL_UPDATES = ("standard", "spherical")
 
@@ -1095,6 +1103,9 @@ class SDTCSEModel(nn.Module):
             "visual_embeddings": visual_embeddings,
             "unimodal_circular_cse_enabled": (
                 self.experiment_mode in ALL_MODAL_CSE_MODES
+            ),
+            "confusion_gap_enabled": (
+                self.experiment_mode in CONFUSION_GAP_MODES
             ),
             "fusion_logits": fusion_logits,
             "text_logits": text_logits,

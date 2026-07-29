@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 
+import numpy as np
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(TEST_DIR)
@@ -18,6 +19,7 @@ from aggregate_results import (  # noqa: E402
 )
 from train import (  # noqa: E402
     build_argument_parser,
+    confusion_pair_metrics,
     experiment_directory_name,
     is_better_selection,
     is_better_validation,
@@ -117,6 +119,24 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_learnable_angles_confusion_gap",
+                0.1,
+                "equal",
+                0.1,
+                "validation",
+                "standard",
+                0.1,
+                0.1,
+                75.0,
+                0.1,
+            ),
+            (
+                "sdt_cse_learnable_angles_confusion_gap_equal_"
+                "lambda_0.1_angle_0.1_mingap_75_gap_0.1"
+            ),
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse",
                 0.1,
                 "equal",
@@ -152,12 +172,38 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(learnable.circular_geometry, "nrc_vad")
         self.assertEqual(learnable.angle_weight, 0.1)
 
+        confusion_gap = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_learnable_angles_confusion_gap",
+            ]
+        )
+        validate_arguments(confusion_gap)
+        self.assertEqual(confusion_gap.circular_geometry, "equal")
+        self.assertEqual(confusion_gap.angle_weight, 0.1)
+        self.assertEqual(confusion_gap.confusion_gap_weight, 0.1)
+        self.assertEqual(
+            confusion_gap.minimum_confusion_gap_degrees, 75.0
+        )
+
+        invalid_prior = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_learnable_angles_confusion_gap",
+                "--circular-geometry",
+                "nrc_vad",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_prior)
+
         fixed = parser.parse_args(
             ["--experiment-mode", "sdt_cse"]
         )
         validate_arguments(fixed)
         self.assertEqual(fixed.circular_geometry, "equal")
         self.assertEqual(fixed.angle_weight, 0.0)
+        self.assertEqual(fixed.confusion_gap_weight, 0.0)
         self.assertEqual(fixed.sdt_residual_update, "standard")
 
     def test_aggregation_separates_test_selected_results(self):
@@ -176,6 +222,25 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(
             condition_name(all_modal),
             "sdt_cse_all_modal_cse_lambda_0.1_test_selected",
+        )
+        confusion_gap = dict(summary)
+        confusion_gap.update(
+            {
+                "experiment_mode": (
+                    "sdt_cse_learnable_angles_confusion_gap"
+                ),
+                "angle_weight": 0.1,
+                "minimum_confusion_gap_degrees": 75.0,
+                "confusion_gap_weight": 1.0,
+            }
+        )
+        self.assertEqual(
+            condition_name(confusion_gap),
+            (
+                "sdt_cse_learnable_angles_confusion_gap_equal_"
+                "lambda_0.1_angle_0.1_mingap_75_gap_1_"
+                "test_selected"
+            ),
         )
 
         spherical = dict(summary)
@@ -208,6 +273,24 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertAlmostEqual(statistics["final_alpha_min"], 0.11)
         self.assertAlmostEqual(statistics["final_alpha_max"], 0.23)
+
+    def test_confusion_pair_metrics_are_reported_separately(self):
+        labels = np.asarray([0, 4, 0, 4, 3, 5, 3, 5])
+        predictions = np.asarray([0, 4, 4, 0, 3, 5, 5, 3])
+        metrics = confusion_pair_metrics(labels, predictions)
+        self.assertAlmostEqual(
+            metrics["happy_excited_pair_macro_f1"], 50.0
+        )
+        self.assertAlmostEqual(
+            metrics["happy_excited_mutual_confusion_rate"], 50.0
+        )
+        self.assertAlmostEqual(
+            metrics["angry_frustrated_pair_macro_f1"], 50.0
+        )
+        self.assertAlmostEqual(
+            metrics["angry_frustrated_mutual_confusion_rate"],
+            50.0,
+        )
 
 
 if __name__ == "__main__":

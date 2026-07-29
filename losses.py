@@ -13,6 +13,10 @@ ID2EMOTION = {
     4: "excited",
     5: "frustrated",
 }
+IEMOCAP_CONFUSION_PAIRS = (
+    (0, 4),  # happy -> excited
+    (3, 5),  # angry -> frustrated
+)
 EMOTION_NAMES = [ID2EMOTION[index] for index in range(len(ID2EMOTION))]
 IEMOCAP_CLASS_FREQUENCIES = (
     0.086747,
@@ -93,6 +97,64 @@ def build_target_similarity(class_angles):
     return torch.cos(
         class_angles[:, None] - class_angles[None, :]
     )
+
+
+def circular_pair_distances(
+    class_angles,
+    pairs=IEMOCAP_CONFUSION_PAIRS,
+):
+    """Return shortest circular distances for selected class pairs."""
+    if class_angles.ndim != 1:
+        raise ValueError("class_angles must be one-dimensional")
+    if not torch.isfinite(class_angles).all():
+        raise ValueError(
+            "class_angles must contain only finite values"
+        )
+    if not pairs:
+        raise ValueError("pairs must not be empty")
+    pair_ids = torch.as_tensor(
+        pairs,
+        dtype=torch.long,
+        device=class_angles.device,
+    )
+    if pair_ids.ndim != 2 or pair_ids.size(1) != 2:
+        raise ValueError("pairs must have shape [P, 2]")
+    if pair_ids.min().item() < 0:
+        raise ValueError("pair class IDs must be nonnegative")
+    if pair_ids.max().item() >= class_angles.numel():
+        raise ValueError("pair class ID exceeds configured angles")
+    differences = (
+        class_angles[pair_ids[:, 0]]
+        - class_angles[pair_ids[:, 1]]
+    )
+    two_pi = differences.new_tensor(2.0 * math.pi)
+    wrapped = torch.remainder(torch.abs(differences), two_pi)
+    return torch.minimum(
+        wrapped,
+        two_pi - wrapped,
+    )
+
+
+def minimum_confusion_gap_regularization(
+    class_angles,
+    minimum_gap_degrees=75.0,
+    pairs=IEMOCAP_CONFUSION_PAIRS,
+):
+    """Penalize predefined confusion-pair angles below a minimum."""
+    minimum_gap_degrees = float(minimum_gap_degrees)
+    if (
+        not math.isfinite(minimum_gap_degrees)
+        or minimum_gap_degrees <= 0.0
+        or minimum_gap_degrees > 180.0
+    ):
+        raise ValueError(
+            "minimum_gap_degrees must be finite and in (0, 180]"
+        )
+    distances = circular_pair_distances(class_angles, pairs)
+    minimum = distances.new_tensor(
+        math.radians(minimum_gap_degrees)
+    )
+    return F.relu(minimum - distances).pow(2).sum()
 
 
 def iemocap_class_weights(device=None, dtype=torch.float32):
@@ -244,6 +306,8 @@ def compute_sdt_cse_losses(
     distillation_weight=1.0,
     circular_weight=0.0,
     angle_weight=0.0,
+    confusion_gap_weight=0.0,
+    minimum_confusion_gap_degrees=75.0,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
@@ -251,6 +315,7 @@ def compute_sdt_cse_losses(
         "distillation_weight": distillation_weight,
         "circular_weight": circular_weight,
         "angle_weight": angle_weight,
+        "confusion_gap_weight": confusion_gap_weight,
     }.items():
         if value < 0:
             raise ValueError("{} must be nonnegative".format(name))
@@ -387,12 +452,33 @@ def compute_sdt_cse_losses(
         raise ValueError(
             "positive angle_weight requires learnable circular angles"
         )
+    confusion_gap_regularization = (
+        outputs["fusion_logits"].sum() * 0.0
+    )
+    if outputs.get("confusion_gap_enabled", False):
+        if outputs.get("class_angles") is None:
+            raise ValueError(
+                "confusion-gap mode requires learnable circular angles"
+            )
+        confusion_gap_regularization = (
+            minimum_confusion_gap_regularization(
+                outputs["class_angles"],
+                minimum_gap_degrees=(
+                    minimum_confusion_gap_degrees
+                ),
+            )
+        )
+    elif confusion_gap_weight > 0:
+        raise ValueError(
+            "positive confusion_gap_weight requires confusion-gap mode"
+        )
     total = (
         fusion_ce_weight * fusion_ce
         + unimodal_ce_weight * unimodal_ce
         + distillation_weight * distillation
         + circular_weight * total_circular
         + angle_weight * angle_regularization
+        + confusion_gap_weight * confusion_gap_regularization
     )
     return {
         "total_loss": total,
@@ -413,4 +499,7 @@ def compute_sdt_cse_losses(
         "unimodal_circular_cse": unimodal_circular,
         "total_circular_cse": total_circular,
         "angle_regularization": angle_regularization,
+        "confusion_gap_regularization": (
+            confusion_gap_regularization
+        ),
     }

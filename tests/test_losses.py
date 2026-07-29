@@ -16,13 +16,54 @@ from losses import (  # noqa: E402
     build_iemocap_angles,
     build_iemocap_vad_anchors,
     build_target_similarity,
+    circular_pair_distances,
     compute_sdt_cse_losses,
     iemocap_class_weights,
     masked_self_distillation_kl,
+    minimum_confusion_gap_regularization,
 )
 
 
 class CircularCSELossTest(unittest.TestCase):
+    def test_confusion_gap_penalty_uses_requested_minimum(self):
+        equal_angles = build_iemocap_angles(geometry="equal")
+        distances = torch.rad2deg(
+            circular_pair_distances(equal_angles)
+        )
+        self.assertTrue(
+            torch.allclose(distances, torch.tensor([60.0, 60.0]))
+        )
+        penalty = minimum_confusion_gap_regularization(
+            equal_angles,
+            minimum_gap_degrees=75.0,
+        )
+        expected = 2.0 * math.radians(15.0) ** 2
+        self.assertAlmostEqual(float(penalty), expected, places=6)
+
+        balanced_angles = torch.deg2rad(
+            torch.tensor(
+                [0.0, 255.0, 307.5, 127.5, 75.0, 202.5]
+            )
+        )
+        satisfied = minimum_confusion_gap_regularization(
+            balanced_angles,
+            minimum_gap_degrees=75.0,
+        )
+        self.assertLess(float(satisfied), 1e-12)
+
+    def test_confusion_gap_penalty_rejects_invalid_inputs(self):
+        angles = build_iemocap_angles()
+        with self.assertRaises(ValueError):
+            minimum_confusion_gap_regularization(
+                angles, minimum_gap_degrees=0.0
+            )
+        with self.assertRaises(ValueError):
+            minimum_confusion_gap_regularization(
+                angles, minimum_gap_degrees=181.0
+            )
+        with self.assertRaises(ValueError):
+            circular_pair_distances(angles, pairs=((0, 6),))
+
     def test_target_similarity_matches_requested_matrix(self):
         target = build_target_similarity(build_iemocap_angles())
         expected = torch.tensor(

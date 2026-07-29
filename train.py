@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import sys
@@ -29,15 +30,19 @@ from losses import (
     CircularCSELoss,
     EMOTION_NAMES,
     ID2EMOTION,
+    IEMOCAP_CONFUSION_PAIRS,
     build_iemocap_angles,
     build_iemocap_vad_anchors,
     build_target_similarity,
+    circular_pair_distances,
     compute_sdt_cse_losses,
     iemocap_class_weights,
+    minimum_confusion_gap_regularization,
 )
 from model import (
     CIRCLE_ORDER,
     CIRCULAR_CSE_MODES,
+    CONFUSION_GAP_MODES,
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
     LEARNABLE_ANGLE_MODES,
@@ -69,6 +74,20 @@ LOSS_NAMES = (
     "unimodal_circular_cse",
     "total_circular_cse",
     "angle_regularization",
+    "confusion_gap_regularization",
+)
+CONFUSION_PAIR_NAMES = (
+    ("happy_excited", 0, 4),
+    ("angry_frustrated", 3, 5),
+)
+CONFUSION_PAIR_METRIC_NAMES = tuple(
+    "{}_{}".format(pair_name, suffix)
+    for pair_name, _, _ in CONFUSION_PAIR_NAMES
+    for suffix in (
+        "pair_macro_f1",
+        "pair_weighted_f1",
+        "mutual_confusion_rate",
+    )
 )
 
 
@@ -162,6 +181,53 @@ def classification_metrics(labels, predictions):
     }
 
 
+def confusion_pair_metrics(labels, predictions):
+    labels = np.asarray(labels, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    result = {}
+    for pair_name, first_id, second_id in CONFUSION_PAIR_NAMES:
+        selected = np.isin(labels, (first_id, second_id))
+        pair_labels = labels[selected]
+        pair_predictions = predictions[selected]
+        prefix = "{}_".format(pair_name)
+        if pair_labels.size == 0:
+            result[prefix + "pair_macro_f1"] = float("nan")
+            result[prefix + "pair_weighted_f1"] = float("nan")
+            result[prefix + "mutual_confusion_rate"] = float("nan")
+            continue
+        result[prefix + "pair_macro_f1"] = float(
+            f1_score(
+                pair_labels,
+                pair_predictions,
+                labels=[first_id, second_id],
+                average="macro",
+                zero_division=0,
+            )
+            * 100.0
+        )
+        result[prefix + "pair_weighted_f1"] = float(
+            f1_score(
+                pair_labels,
+                pair_predictions,
+                labels=[first_id, second_id],
+                average="weighted",
+                zero_division=0,
+            )
+            * 100.0
+        )
+        mutual_confusions = (
+            (pair_labels == first_id)
+            & (pair_predictions == second_id)
+        ) | (
+            (pair_labels == second_id)
+            & (pair_predictions == first_id)
+        )
+        result[prefix + "mutual_confusion_rate"] = float(
+            mutual_confusions.mean() * 100.0
+        )
+    return result
+
+
 def _model_forward(model, batch):
     lengths = (
         batch["utterance_mask"].sum(dim=1).long().cpu().tolist()
@@ -220,6 +286,10 @@ def run_epoch(
                 distillation_weight=args.distillation_weight,
                 circular_weight=args.circular_weight,
                 angle_weight=args.angle_weight,
+                confusion_gap_weight=args.confusion_gap_weight,
+                minimum_confusion_gap_degrees=(
+                    args.minimum_confusion_gap_degrees
+                ),
             )
             if training:
                 losses["total_loss"].backward()
@@ -342,6 +412,7 @@ def run_epoch(
         for name in LOSS_NAMES
     }
     result.update(classification_metrics(labels, predictions))
+    result.update(confusion_pair_metrics(labels, predictions))
     scale = model.effective_cosine_scale
     result["cosine_scale"] = (
         None if scale is None else float(scale.detach().cpu().item())
@@ -548,6 +619,7 @@ def public_metrics(result):
         "weighted_f1",
         "macro_f1",
         "macro_recall",
+        *CONFUSION_PAIR_METRIC_NAMES,
         "cosine_scale",
         "text_cosine_scale",
         "audio_cosine_scale",
@@ -628,8 +700,21 @@ def experiment_directory_name(
     sdt_residual_update="standard",
     spherical_attention_alpha_init=0.1,
     spherical_mlp_alpha_init=0.1,
+    minimum_confusion_gap_degrees=75.0,
+    confusion_gap_weight=0.0,
 ):
-    if mode in LEARNABLE_ANGLE_MODES:
+    if mode in CONFUSION_GAP_MODES:
+        condition = (
+            "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
+        ).format(
+            mode,
+            circular_geometry,
+            format(float(circular_weight), "g"),
+            format(float(angle_weight), "g"),
+            format(float(minimum_confusion_gap_degrees), "g"),
+            format(float(confusion_gap_weight), "g"),
+        )
+    elif mode in LEARNABLE_ANGLE_MODES:
         condition = "{}_{}_lambda_{}_angle_{}".format(
             mode,
             circular_geometry,
@@ -725,7 +810,12 @@ def angle_state_payload(model, fixed_class_angles):
     }
 
 
-def angle_history_row(epoch, model, fixed_class_angles):
+def angle_history_row(
+    epoch,
+    model,
+    fixed_class_angles,
+    minimum_confusion_gap_degrees=None,
+):
     state = current_angle_state(model, fixed_class_angles)
     if not state["learnable"]:
         return None
@@ -754,7 +844,70 @@ def angle_history_row(epoch, model, fixed_class_angles):
         row["gap_{}_to_{}_degrees".format(source, target)] = float(
             gaps[position]
         )
+    if minimum_confusion_gap_degrees is not None:
+        gap_payload = confusion_gap_payload(
+            model,
+            fixed_class_angles,
+            minimum_confusion_gap_degrees,
+        )
+        row["minimum_confusion_gap_degrees"] = (
+            gap_payload["minimum_confusion_gap_degrees"]
+        )
+        row["confusion_gap_regularization"] = gap_payload[
+            "confusion_gap_regularization"
+        ]
+        for name, gap in gap_payload[
+            "confusion_pair_gaps_degrees"
+        ].items():
+            row["confusion_gap_{}_degrees".format(name)] = gap
     return row
+
+
+def confusion_gap_payload(
+    model,
+    fixed_class_angles,
+    minimum_gap_degrees,
+):
+    state = current_angle_state(model, fixed_class_angles)
+    angles = state["angles"]
+    distances = circular_pair_distances(
+        angles,
+        IEMOCAP_CONFUSION_PAIRS,
+    )
+    penalty = minimum_confusion_gap_regularization(
+        angles,
+        minimum_gap_degrees=minimum_gap_degrees,
+        pairs=IEMOCAP_CONFUSION_PAIRS,
+    )
+    pair_gaps = {}
+    for pair, distance in zip(
+        IEMOCAP_CONFUSION_PAIRS,
+        distances.detach().cpu().tolist(),
+    ):
+        first_id, second_id = pair
+        name = "{}_{}".format(
+            ID2EMOTION[first_id],
+            ID2EMOTION[second_id],
+        )
+        pair_gaps[name] = float(math.degrees(distance))
+    return {
+        "minimum_confusion_gap_degrees": float(
+            minimum_gap_degrees
+        ),
+        "confusion_pairs": [
+            {
+                "first_id": int(first_id),
+                "first_emotion": ID2EMOTION[first_id],
+                "second_id": int(second_id),
+                "second_emotion": ID2EMOTION[second_id],
+            }
+            for first_id, second_id in IEMOCAP_CONFUSION_PAIRS
+        ],
+        "confusion_pair_gaps_degrees": pair_gaps,
+        "confusion_gap_regularization": float(
+            penalty.detach().cpu().item()
+        ),
+    }
 
 
 def spherical_residual_gate_payload(model):
@@ -835,6 +988,11 @@ def save_checkpoint(
         ),
     )
     angle_payload = angle_state_payload(model, angles)
+    gap_payload = confusion_gap_payload(
+        model,
+        angles,
+        args.minimum_confusion_gap_degrees,
+    )
     selected_angles = torch.tensor(
         angle_payload["class_angles_radians"],
         dtype=angles.dtype,
@@ -851,6 +1009,8 @@ def save_checkpoint(
         ],
         "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
         "angle_weight": args.angle_weight,
+        "confusion_gap_weight": args.confusion_gap_weight,
+        **gap_payload,
         "circle_order": angle_payload["circle_order"],
         "prior_class_angles": angle_payload[
             "prior_angles_radians"
@@ -947,21 +1107,39 @@ def validate_arguments(args):
         "distillation_weight",
         "circular_weight",
         "angle_weight",
+        "confusion_gap_weight",
         "same_class_margin",
     ):
         if getattr(args, name) < 0:
             raise ValueError("--{} must be nonnegative".format(
                 name.replace("_", "-")
             ))
+    if (
+        not np.isfinite(args.minimum_confusion_gap_degrees)
+        or args.minimum_confusion_gap_degrees <= 0.0
+        or args.minimum_confusion_gap_degrees > 180.0
+    ):
+        raise ValueError(
+            "--minimum-confusion-gap-degrees must be finite and "
+            "in (0, 180]"
+        )
     if not np.isfinite(args.vad_center_valence):
         raise ValueError("--vad-center-valence must be finite")
     if not np.isfinite(args.vad_center_arousal):
         raise ValueError("--vad-center-arousal must be finite")
     if args.circular_geometry is None:
-        args.circular_geometry = (
-            "nrc_vad"
-            if args.experiment_mode in LEARNABLE_ANGLE_MODES
-            else "equal"
+        if args.experiment_mode in CONFUSION_GAP_MODES:
+            args.circular_geometry = "equal"
+        elif args.experiment_mode in LEARNABLE_ANGLE_MODES:
+            args.circular_geometry = "nrc_vad"
+        else:
+            args.circular_geometry = "equal"
+    if (
+        args.experiment_mode in CONFUSION_GAP_MODES
+        and args.circular_geometry != "equal"
+    ):
+        raise ValueError(
+            "confusion-gap mode requires --circular-geometry equal"
         )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
@@ -978,6 +1156,8 @@ def validate_arguments(args):
         args.distillation_weight = 0.0
     if args.experiment_mode not in LEARNABLE_ANGLE_MODES:
         args.angle_weight = 0.0
+    if args.experiment_mode not in CONFUSION_GAP_MODES:
+        args.confusion_gap_weight = 0.0
 
 
 def train_and_test(args):
@@ -1004,6 +1184,8 @@ def train_and_test(args):
             args.sdt_residual_update,
             args.spherical_attention_alpha_init,
             args.spherical_mlp_alpha_init,
+            args.minimum_confusion_gap_degrees,
+            args.confusion_gap_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1052,11 +1234,18 @@ def train_and_test(args):
     initial_angle_payload = angle_state_payload(
         model, prior_class_angles
     )
+    initial_gap_payload = confusion_gap_payload(
+        model,
+        prior_class_angles,
+        args.minimum_confusion_gap_degrees,
+    )
     write_json(
         os.path.join(run_dir, "circular_geometry.json"),
         {
             "geometry": args.circular_geometry,
             "angle_weight": args.angle_weight,
+            "confusion_gap_weight": args.confusion_gap_weight,
+            **initial_gap_payload,
             "vad_center": [
                 args.vad_center_valence,
                 args.vad_center_arousal,
@@ -1126,7 +1315,14 @@ def train_and_test(args):
             epoch_rows,
         )
         current_history = angle_history_row(
-            epoch, model, prior_class_angles
+            epoch,
+            model,
+            prior_class_angles,
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
+                if args.experiment_mode in CONFUSION_GAP_MODES
+                else None
+            ),
         )
         if current_history is not None:
             angle_history_rows.append(current_history)
@@ -1192,6 +1388,11 @@ def train_and_test(args):
     selected_class_angles = current_angle_state(
         model, prior_class_angles
     )["angles"].detach()
+    selected_gap_payload = confusion_gap_payload(
+        model,
+        prior_class_angles,
+        args.minimum_confusion_gap_degrees,
+    )
     if model.circular_angle_learner is not None:
         write_json(
             os.path.join(
@@ -1201,6 +1402,8 @@ def train_and_test(args):
                 "selected_epoch": best_epoch,
                 "geometry": args.circular_geometry,
                 "angle_weight": args.angle_weight,
+                "confusion_gap_weight": args.confusion_gap_weight,
+                **selected_gap_payload,
                 "vad_center": [
                     args.vad_center_valence,
                     args.vad_center_arousal,
@@ -1415,6 +1618,8 @@ def train_and_test(args):
         "seed": args.seed,
         "circular_weight": args.circular_weight,
         "angle_weight": args.angle_weight,
+        "confusion_gap_weight": args.confusion_gap_weight,
+        **selected_gap_payload,
         "circular_geometry": args.circular_geometry,
         "vad_center": [
             args.vad_center_valence,
@@ -1518,6 +1723,25 @@ def build_argument_parser():
         ),
     )
     parser.add_argument(
+        "--confusion-gap-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "weight for the minimum happy-excited and "
+            "angry-frustrated angular-gap penalty in confusion-gap "
+            "mode (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-confusion-gap-degrees",
+        type=float,
+        default=75.0,
+        help=(
+            "minimum shortest angle for predefined confusion pairs "
+            "in confusion-gap mode (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--same-class-margin", type=float, default=0.0
     )
     parser.add_argument(
@@ -1528,7 +1752,7 @@ def build_argument_parser():
             "equal uses the original six equally spaced angles; "
             "nrc_vad derives nonuniform angles from NRC-VAD anchors. "
             "Defaults to nrc_vad for sdt_cse_learnable_angles and "
-            "equal for all other modes"
+            "equal for confusion-gap and fixed-angle modes"
         ),
     )
     parser.add_argument(

@@ -12,7 +12,8 @@ for mode in \
   sdt_cse_all_cosine \
   sdt_cse_all_modal_cse \
   sdt_cse_fusion_only \
-  sdt_cse_learnable_angles
+  sdt_cse_learnable_angles \
+  sdt_cse_learnable_angles_confusion_gap
 do
   for seed in $(seq 2024 2033)
   do

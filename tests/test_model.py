@@ -19,7 +19,9 @@ from losses import (  # noqa: E402
     build_iemocap_angles,
     build_target_similarity,
     compute_sdt_cse_losses,
+    circular_pair_distances,
     iemocap_class_weights,
+    minimum_confusion_gap_regularization,
 )
 from model import (  # noqa: E402
     CIRCLE_ORDER,
@@ -95,6 +97,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse_all_modal_cse",
             "sdt_cse_fusion_only",
             "sdt_cse_learnable_angles",
+            "sdt_cse_learnable_angles_confusion_gap",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
@@ -196,7 +199,10 @@ class ModelModeTest(unittest.TestCase):
                 self.assertIsNone(model.text_projector)
                 self.assertIsNone(model.audio_projector)
                 self.assertIsNone(model.visual_projector)
-            if mode == "sdt_cse_learnable_angles":
+            if mode in (
+                "sdt_cse_learnable_angles",
+                "sdt_cse_learnable_angles_confusion_gap",
+            ):
                 self.assertIsNotNone(model.circular_angle_learner)
                 self.assertEqual(outputs["class_angles"].shape, (6,))
                 self.assertEqual(outputs["angle_gaps"].shape, (6,))
@@ -823,6 +829,97 @@ class LearnableCircularAnglesTest(unittest.TestCase):
         self.assertIsNotNone(model.t_output_layer[-1].weight.grad)
         self.assertIsNotNone(model.fusion_projector.linear_1.weight.grad)
 
+    def test_confusion_gap_mode_adds_only_requested_penalty(self):
+        prior = build_iemocap_angles(geometry="equal")
+        model = make_model(
+            "sdt_cse_learnable_angles_confusion_gap",
+            initial_class_angles=prior,
+        )
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        common = {
+            "outputs": outputs,
+            "labels": labels,
+            "utterance_mask": inputs[3],
+            "class_weights": iemocap_class_weights(),
+            "circular_loss_function": CircularCSELoss(
+                class_angles=prior
+            ),
+            "circular_weight": 0.1,
+            "angle_weight": 0.1,
+            "minimum_confusion_gap_degrees": 75.0,
+        }
+        without_gap = compute_sdt_cse_losses(
+            confusion_gap_weight=0.0,
+            **common
+        )
+        with_gap = compute_sdt_cse_losses(
+            confusion_gap_weight=0.1,
+            **common
+        )
+        expected_penalty = 2.0 * math.radians(15.0) ** 2
+        self.assertAlmostEqual(
+            float(with_gap["confusion_gap_regularization"]),
+            expected_penalty,
+            places=5,
+        )
+        self.assertTrue(
+            torch.allclose(
+                with_gap["total_loss"],
+                without_gap["total_loss"]
+                + 0.1
+                * with_gap["confusion_gap_regularization"],
+            )
+        )
+        with_gap["confusion_gap_regularization"].backward()
+        gradient = model.circular_angle_learner.raw_gaps.grad
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_confusion_gap_gradient_increases_selected_gaps(self):
+        learner = LearnableCircularAngles(
+            prior_angles=build_iemocap_angles(geometry="equal")
+        )
+        optimizer = torch.optim.SGD(learner.parameters(), lr=0.1)
+        before = circular_pair_distances(learner()).detach()
+        penalty = minimum_confusion_gap_regularization(
+            learner(),
+            minimum_gap_degrees=75.0,
+        )
+        penalty.backward()
+        optimizer.step()
+        after = circular_pair_distances(learner()).detach()
+        self.assertTrue(torch.all(after > before))
+        self.assertTrue(torch.all(learner.normalized_gaps() > 0))
+
+    def test_confusion_gap_history_records_pair_angles(self):
+        prior = build_iemocap_angles(geometry="equal")
+        model = make_model(
+            "sdt_cse_learnable_angles_confusion_gap",
+            initial_class_angles=prior,
+        )
+        history = angle_history_row(
+            1,
+            model,
+            prior,
+            minimum_confusion_gap_degrees=75.0,
+        )
+        self.assertAlmostEqual(
+            history["confusion_gap_happy_excited_degrees"],
+            60.0,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            history["confusion_gap_angry_frustrated_degrees"],
+            60.0,
+            places=4,
+        )
+        self.assertGreater(
+            history["confusion_gap_regularization"], 0.0
+        )
+
     def test_angle_weight_only_adds_prior_penalty(self):
         prior = build_iemocap_angles(geometry="nrc_vad")
         model = make_model(
@@ -1009,6 +1106,51 @@ class LearnableCircularAnglesTest(unittest.TestCase):
         self.assertIn(
             "gap_happy_to_excited_degrees", history
         )
+
+    def test_confusion_gap_checkpoint_contains_constraint_metadata(self):
+        prior = build_iemocap_angles(geometry="equal")
+        model = make_model(
+            "sdt_cse_learnable_angles_confusion_gap",
+            initial_class_angles=prior,
+        )
+        optimizer = build_optimizer(model, 1e-4, 1e-5)
+        args = build_argument_parser().parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_learnable_angles_confusion_gap",
+                "--confusion-gap-weight",
+                "1.0",
+                "--minimum-confusion-gap-degrees",
+                "75",
+            ]
+        )
+        validate_arguments(args)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pt")
+            save_checkpoint(
+                path,
+                model,
+                optimizer,
+                args,
+                {
+                    "training": ["train"],
+                    "validation": ["valid"],
+                    "testing": ["test"],
+                },
+                epoch=1,
+                validation_metrics={"weighted_f1": 1.0},
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+        self.assertEqual(checkpoint["circular_geometry"], "equal")
+        self.assertEqual(checkpoint["confusion_gap_weight"], 1.0)
+        self.assertEqual(
+            checkpoint["minimum_confusion_gap_degrees"], 75.0
+        )
+        for value in checkpoint[
+            "confusion_pair_gaps_degrees"
+        ].values():
+            self.assertAlmostEqual(value, 60.0, places=4)
+        self.assertEqual(len(checkpoint["confusion_pairs"]), 2)
 
 
 class OriginalSDTParityTest(unittest.TestCase):

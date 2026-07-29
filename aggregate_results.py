@@ -20,6 +20,13 @@ METRICS = (
     "unimodal_circular_cse",
     "total_circular_cse",
     "angle_regularization",
+    "confusion_gap_regularization",
+    "happy_excited_pair_macro_f1",
+    "happy_excited_pair_weighted_f1",
+    "happy_excited_mutual_confusion_rate",
+    "angry_frustrated_pair_macro_f1",
+    "angry_frustrated_pair_weighted_f1",
+    "angry_frustrated_mutual_confusion_rate",
 )
 
 
@@ -38,7 +45,29 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse_learnable_angles":
+    if mode == "sdt_cse_learnable_angles_confusion_gap":
+        geometry = summary.get("circular_geometry", "equal")
+        condition = (
+            "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
+        ).format(
+            mode,
+            geometry,
+            format(float(summary["circular_weight"]), "g"),
+            format(float(summary.get("angle_weight", 0.1)), "g"),
+            format(
+                float(
+                    summary.get(
+                        "minimum_confusion_gap_degrees", 75.0
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(summary.get("confusion_gap_weight", 0.1)),
+                "g",
+            ),
+        )
+    elif mode == "sdt_cse_learnable_angles":
         geometry = summary.get("circular_geometry", "nrc_vad")
         condition = "{}_{}_lambda_{}_angle_{}".format(
             mode,
@@ -144,8 +173,12 @@ def aggregate(output_dir):
                 "sdt_residual_update", "standard"
             ),
         }
+        validation = summary.get("validation") or {}
         for metric in METRICS:
             row["test_{}".format(metric)] = summary["test"].get(metric)
+            row["validation_{}".format(metric)] = validation.get(
+                metric
+            )
         row.update(residual_gate_statistics(summary))
         rows.append(row)
         grouped.setdefault(condition, []).append(row)
@@ -176,6 +209,26 @@ def aggregate(output_dir):
             )
             item["{}_std".format(metric)] = (
                 float(values.std()) if values.size else ""
+            )
+            validation_values = np.asarray(
+                [
+                    row["validation_{}".format(metric)]
+                    for row in condition_rows
+                    if row[
+                        "validation_{}".format(metric)
+                    ] is not None
+                ],
+                dtype=np.float64,
+            )
+            item["validation_{}_mean".format(metric)] = (
+                float(validation_values.mean())
+                if validation_values.size
+                else ""
+            )
+            item["validation_{}_std".format(metric)] = (
+                float(validation_values.std())
+                if validation_values.size
+                else ""
             )
         for metric in (
             "final_attention_alpha_mean",
@@ -238,6 +291,24 @@ def aggregate(output_dir):
                         None
                         if left_value is None or right_value is None
                         else right_value - left_value
+                    )
+                    left_validation = by_condition_seed[(left, seed)][
+                        "validation_{}".format(metric)
+                    ]
+                    right_validation = by_condition_seed[(right, seed)][
+                        "validation_{}".format(metric)
+                    ]
+                    item[
+                        "validation_right_minus_left_{}".format(
+                            metric
+                        )
+                    ] = (
+                        None
+                        if (
+                            left_validation is None
+                            or right_validation is None
+                        )
+                        else right_validation - left_validation
                     )
                 paired_rows.append(item)
     if paired_rows:
