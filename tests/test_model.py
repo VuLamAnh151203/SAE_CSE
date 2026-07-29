@@ -26,13 +26,16 @@ from model import (  # noqa: E402
     CosineEmotionClassifier,
     LearnableCircularAngles,
     SDTCSEModel,
+    SphericalResidualUpdate,
     SphericalFusionHead,
+    TransformerEncoder,
 )
 from train import (  # noqa: E402
     angle_history_row,
     build_argument_parser,
     build_optimizer,
     save_checkpoint,
+    spherical_residual_history_row,
     validate_arguments,
 )
 
@@ -63,7 +66,7 @@ def make_inputs():
     )
 
 
-def make_model(mode, initial_class_angles=None):
+def make_model(mode, initial_class_angles=None, **kwargs):
     return SDTCSEModel(
         d_text=5,
         d_visual=4,
@@ -77,6 +80,7 @@ def make_model(mode, initial_class_angles=None):
         embedding_dim=6,
         projection_dropout=0.0,
         initial_class_angles=initial_class_angles,
+        **kwargs
     )
 
 
@@ -312,6 +316,334 @@ class ModelModeTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(losses["total_loss"], expected))
         self.assertEqual(float(losses["circular_cse"]), 0.0)
+
+
+class SphericalResidualUpdateTest(unittest.TestCase):
+    def test_initial_alpha_unit_norm_padding_and_scale_invariance(self):
+        torch.manual_seed(19)
+        module = SphericalResidualUpdate(
+            hidden_dim=4,
+            initial_alpha=0.1,
+        )
+        current = torch.randn(2, 3, 4)
+        proposal = torch.randn(2, 3, 4)
+        padding_mask = torch.tensor(
+            [[False, False, True], [False, True, True]]
+        )
+        output = module(current, proposal, padding_mask)
+        scaled = module(
+            current * 7.0,
+            proposal * 0.25,
+            padding_mask,
+        )
+        self.assertAlmostEqual(
+            float(module.effective_alpha), 0.1, places=6
+        )
+        self.assertTrue(torch.allclose(output, scaled, atol=1e-6))
+        valid_norms = output[~padding_mask].norm(dim=-1)
+        self.assertTrue(
+            torch.allclose(
+                valid_norms,
+                torch.ones_like(valid_norms),
+                atol=1e-6,
+            )
+        )
+        self.assertEqual(float(output[padding_mask].abs().sum()), 0.0)
+
+    def test_antipodal_fallback_and_zero_proposal_are_finite(self):
+        module = SphericalResidualUpdate(
+            hidden_dim=3,
+            initial_alpha=0.5,
+        )
+        current = torch.tensor(
+            [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+        )
+        antipodal = -current
+        output = module(current, antipodal)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertTrue(torch.allclose(output, current, atol=1e-6))
+        zero_output = module(current, torch.zeros_like(current))
+        self.assertTrue(torch.isfinite(zero_output).all())
+        self.assertTrue(
+            torch.allclose(
+                zero_output.norm(dim=-1),
+                torch.ones((1, 2)),
+                atol=1e-6,
+            )
+        )
+
+    def test_gradients_reach_gate_current_and_proposal(self):
+        torch.manual_seed(23)
+        module = SphericalResidualUpdate(5, initial_alpha=0.2)
+        current = torch.randn(2, 3, 5, requires_grad=True)
+        proposal = torch.randn(2, 3, 5, requires_grad=True)
+        target = torch.randn(2, 3, 5)
+        loss = (module(current, proposal) * target).sum()
+        loss.backward()
+        for gradient in (
+            module.alpha_logit.grad,
+            current.grad,
+            proposal.grad,
+        ):
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_invalid_inputs_fail_clearly(self):
+        with self.assertRaises(ValueError):
+            SphericalResidualUpdate(0)
+        with self.assertRaises(ValueError):
+            SphericalResidualUpdate(4, initial_alpha=0.0)
+        with self.assertRaises(ValueError):
+            SphericalResidualUpdate(4, eps=0.0)
+        module = SphericalResidualUpdate(4)
+        with self.assertRaises(ValueError):
+            module(torch.randn(2, 4), torch.randn(2, 4))
+        with self.assertRaises(ValueError):
+            module(torch.randn(2, 3, 4), torch.randn(2, 2, 4))
+        with self.assertRaises(ValueError):
+            module(
+                torch.randn(2, 3, 4),
+                torch.randn(2, 3, 4),
+                torch.zeros(2, 2, dtype=torch.bool),
+            )
+        current = torch.randn(2, 3, 4)
+        current[0, 0, 0] = float("nan")
+        with self.assertRaises(ValueError):
+            module(current, torch.randn(2, 3, 4))
+
+    def test_model_has_eighteen_independent_gates_and_unit_branches(self):
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            sdt_residual_update="spherical",
+            spherical_attention_alpha_init=0.1,
+            spherical_mlp_alpha_init=0.2,
+        ).eval()
+        updates = model.named_spherical_residual_updates()
+        self.assertEqual(len(updates), 18)
+        self.assertEqual(
+            len({id(module.alpha_logit) for _, module in updates}),
+            18,
+        )
+        self.assertEqual(
+            sum(name.endswith("attention_update") for name, _ in updates),
+            9,
+        )
+        self.assertEqual(
+            sum(name.endswith("mlp_update") for name, _ in updates),
+            9,
+        )
+        for name, module in updates:
+            expected = 0.1 if name.endswith("attention_update") else 0.2
+            self.assertAlmostEqual(
+                float(module.effective_alpha), expected, places=6
+            )
+
+        captured = {}
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, TransformerEncoder):
+                handles.append(
+                    module.register_forward_hook(
+                        lambda _module, _inputs, output, key=name: (
+                            captured.__setitem__(key, output.detach())
+                        )
+                    )
+                )
+        inputs = make_inputs()
+        with torch.no_grad():
+            model(*inputs)
+        for handle in handles:
+            handle.remove()
+        self.assertEqual(len(captured), 9)
+        valid = inputs[3].bool()
+        for output in captured.values():
+            valid_norms = output[valid].norm(dim=-1)
+            self.assertTrue(
+                torch.allclose(
+                    valid_norms,
+                    torch.ones_like(valid_norms),
+                    atol=1e-5,
+                )
+            )
+            self.assertEqual(float(output[~valid].abs().sum()), 0.0)
+
+    def test_standard_model_has_no_spherical_parameters(self):
+        model = make_model("sdt")
+        self.assertEqual(model.named_spherical_residual_updates(), [])
+        self.assertFalse(
+            any(
+                "alpha_logit" in name
+                for name, _ in model.named_parameters()
+            )
+        )
+
+    def test_full_loss_gradients_reach_all_spherical_gates(self):
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            initial_class_angles=build_iemocap_angles(
+                geometry="equal"
+            ),
+            sdt_residual_update="spherical",
+        )
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(),
+            circular_weight=0.1,
+            angle_weight=0.1,
+        )
+        losses["total_loss"].backward()
+        for _, module in model.named_spherical_residual_updates():
+            self.assertIsNotNone(module.alpha_logit.grad)
+            self.assertTrue(
+                torch.isfinite(module.alpha_logit.grad).all()
+            )
+            self.assertGreater(
+                float(module.alpha_logit.grad.abs().sum()), 0.0
+            )
+
+    def test_ce_kl_and_circular_losses_each_reach_spherical_gates(self):
+        inputs = make_inputs()
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        for loss_name in ("fusion_ce", "distillation", "circular_cse"):
+            model = make_model(
+                "sdt_cse",
+                sdt_residual_update="spherical",
+            )
+            outputs = model(*inputs)
+            losses = compute_sdt_cse_losses(
+                outputs,
+                labels,
+                inputs[3],
+                iemocap_class_weights(),
+                circular_loss_function=CircularCSELoss(),
+                circular_weight=0.1,
+            )
+            losses[loss_name].backward()
+            for _, module in model.named_spherical_residual_updates():
+                gradient = module.alpha_logit.grad
+                self.assertIsNotNone(
+                    gradient,
+                    msg="{} did not reach a gate".format(loss_name),
+                )
+                self.assertTrue(torch.isfinite(gradient).all())
+                self.assertGreater(
+                    float(gradient.abs().sum()),
+                    0.0,
+                    msg="{} produced a zero gate gradient".format(
+                        loss_name
+                    ),
+                )
+
+    def test_optimizer_excludes_all_spherical_gates_from_decay(self):
+        model = make_model(
+            "sdt_cse_learnable_angles",
+            sdt_residual_update="spherical",
+        )
+        optimizer = build_optimizer(model, 1e-4, 1e-5)
+        zero_decay_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            if group["weight_decay"] == 0.0
+            for parameter in group["params"]
+        }
+        expected_ids = {
+            id(parameter)
+            for parameter in model.spherical_residual_parameters()
+        }
+        expected_ids.add(id(model.circular_angle_learner.raw_gaps))
+        self.assertTrue(expected_ids.issubset(zero_decay_ids))
+
+    def test_diagnostics_report_all_updates(self):
+        model = make_model(
+            "sdt_cse",
+            sdt_residual_update="spherical",
+        ).eval()
+        model.enable_spherical_residual_diagnostics(True, reset=True)
+        with torch.no_grad():
+            model(*make_inputs())
+        diagnostics = model.spherical_residual_diagnostics()
+        model.enable_spherical_residual_diagnostics(False, reset=False)
+        self.assertEqual(len(diagnostics), 18)
+        for values in diagnostics.values():
+            self.assertEqual(values["valid_state_count"], 6)
+            self.assertAlmostEqual(
+                values["output_norm_mean"], 1.0, places=5
+            )
+            self.assertIsNotNone(
+                values["mean_angular_movement_degrees"]
+            )
+
+    def test_checkpoint_and_history_preserve_spherical_gates(self):
+        model = make_model(
+            "sdt_cse",
+            sdt_residual_update="spherical",
+            spherical_attention_alpha_init=0.1,
+            spherical_mlp_alpha_init=0.2,
+        )
+        with torch.no_grad():
+            model.t_t.transformer_inter[
+                0
+            ].attention_update.alpha_logit.add_(0.3)
+        optimizer = build_optimizer(model, 1e-4, 1e-5)
+        args = build_argument_parser().parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse",
+                "--sdt-residual-update",
+                "spherical",
+                "--spherical-attention-alpha-init",
+                "0.1",
+                "--spherical-mlp-alpha-init",
+                "0.2",
+            ]
+        )
+        validate_arguments(args)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pt")
+            save_checkpoint(
+                path,
+                model,
+                optimizer,
+                args,
+                {
+                    "training": ["train"],
+                    "validation": ["valid"],
+                    "testing": ["test"],
+                },
+                epoch=3,
+                validation_metrics={"weighted_f1": 60.0},
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+        self.assertEqual(
+            checkpoint["sdt_residual_update"], "spherical"
+        )
+        self.assertEqual(
+            len(checkpoint["spherical_residual_gates"]), 18
+        )
+        restored = make_model(
+            "sdt_cse",
+            sdt_residual_update="spherical",
+            spherical_attention_alpha_init=0.1,
+            spherical_mlp_alpha_init=0.2,
+        )
+        restored.load_state_dict(checkpoint["model_state_dict"])
+        for name, alpha in model.spherical_residual_gate_state().items():
+            self.assertTrue(
+                torch.allclose(
+                    alpha,
+                    restored.spherical_residual_gate_state()[name],
+                )
+            )
+        history = spherical_residual_history_row(3, restored)
+        self.assertEqual(history["epoch"], 3)
+        self.assertEqual(len(history), 19)
 
 
 class LearnableCircularAnglesTest(unittest.TestCase):

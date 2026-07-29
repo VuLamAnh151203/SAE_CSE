@@ -12,7 +12,10 @@ from dataloader import (  # noqa: E402
     fixed_train_validation_test_split,
     original_test_selection_split,
 )
-from aggregate_results import condition_name  # noqa: E402
+from aggregate_results import (  # noqa: E402
+    condition_name,
+    residual_gate_statistics,
+)
 from train import (  # noqa: E402
     build_argument_parser,
     experiment_directory_name,
@@ -114,6 +117,23 @@ class FixedSplitTest(unittest.TestCase):
             ),
             "sdt_cse_lambda_0.1_test_selected",
         )
+        self.assertEqual(
+            experiment_directory_name(
+                "sdt_cse_learnable_angles",
+                0.1,
+                "equal",
+                0.1,
+                "test",
+                "spherical",
+                0.1,
+                0.2,
+            ),
+            (
+                "sdt_cse_learnable_angles_equal_lambda_0.1_"
+                "angle_0.1_spherical_residual_a0.1_m0.2_"
+                "test_selected"
+            ),
+        )
 
     def test_learnable_mode_uses_nrc_default_and_fixed_modes_do_not(self):
         parser = build_argument_parser()
@@ -130,6 +150,7 @@ class FixedSplitTest(unittest.TestCase):
         validate_arguments(fixed)
         self.assertEqual(fixed.circular_geometry, "equal")
         self.assertEqual(fixed.angle_weight, 0.0)
+        self.assertEqual(fixed.sdt_residual_update, "standard")
 
     def test_aggregation_separates_test_selected_results(self):
         summary = {
@@ -142,6 +163,37 @@ class FixedSplitTest(unittest.TestCase):
             condition_name(summary),
             "sdt_cse_lambda_0.1_test_selected",
         )
+
+        spherical = dict(summary)
+        spherical.update(
+            {
+                "sdt_residual_update": "spherical",
+                "spherical_attention_alpha_init": 0.1,
+                "spherical_mlp_alpha_init": 0.2,
+            }
+        )
+        self.assertEqual(
+            condition_name(spherical),
+            (
+                "sdt_cse_lambda_0.1_spherical_residual_"
+                "a0.1_m0.2_test_selected"
+            ),
+        )
+        spherical["spherical_residual_gates"] = {
+            "t_t.transformer_inter.0.attention_update": 0.11,
+            "a_t.transformer_inter.0.attention_update": 0.13,
+            "t_t.transformer_inter.0.mlp_update": 0.21,
+            "a_t.transformer_inter.0.mlp_update": 0.23,
+        }
+        statistics = residual_gate_statistics(spherical)
+        self.assertAlmostEqual(
+            statistics["final_attention_alpha_mean"], 0.12
+        )
+        self.assertAlmostEqual(
+            statistics["final_mlp_alpha_mean"], 0.22
+        )
+        self.assertAlmostEqual(statistics["final_alpha_min"], 0.11)
+        self.assertAlmostEqual(statistics["final_alpha_max"], 0.23)
 
 
 if __name__ == "__main__":

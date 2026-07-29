@@ -42,6 +42,42 @@ The comparisons have distinct purposes:
 - `sdt_cse_learnable_angles - sdt_cse` isolates learning ordered class
   angles while preserving the complete standard SDT-CSE architecture.
 
+## Internal spherical residuals
+
+Every experiment mode supports an orthogonal residual option:
+
+```text
+--sdt-residual-update {standard,spherical}
+```
+
+`standard` is the default and preserves the original SDT additions. The
+`spherical` option replaces the attention and MLP additions inside each of
+the nine intra/inter-modal transformer branches with:
+
+```text
+normalize(
+  (1 - alpha) * normalize(current)
+  + alpha * normalize(proposal)
+)
+```
+
+Each branch owns one scalar attention alpha and one scalar MLP alpha: 18
+learned gates in total. Valid utterance states remain unit norm after both
+updates, while padded states remain zero. Positional/speaker embeddings,
+attention, LayerNorm, MLP, fusion gates, classifiers, and losses otherwise
+retain their existing definitions.
+
+Configure the two initial gates with:
+
+```text
+--spherical-attention-alpha-init 0.1
+--spherical-mlp-alpha-init 0.1
+```
+
+Gate logits use the normal learning rate and zero weight decay. Spherical
+residuals add no new loss term and can be combined with every experiment
+mode and every loss ablation.
+
 ## Data split
 
 The default feature file is:
@@ -246,6 +282,29 @@ This writes to:
 results/sdt_cse_learnable_angles_nrc_vad_lambda_0.1_angle_0.1/seed_2024/
 ```
 
+Run learnable equal-initialized angles with internal spherical residuals:
+
+```bash
+python train.py \
+  --experiment-mode sdt_cse_learnable_angles \
+  --selection-protocol validation \
+  --circular-geometry equal \
+  --circular-weight 0.1 \
+  --angle-weight 0.1 \
+  --sdt-residual-update spherical \
+  --spherical-attention-alpha-init 0.1 \
+  --spherical-mlp-alpha-init 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
+This writes to:
+
+```text
+results/sdt_cse_learnable_angles_equal_lambda_0.1_angle_0.1_spherical_residual_a0.1_m0.1/seed_2024/
+```
+
 Select another visible GPU by changing `--gpu-id`, for example:
 
 ```bash
@@ -289,6 +348,29 @@ Run that protocol over seeds 2024-2033:
 ```bash
 GPU_ID=0 bash exec_iemocap_test_selected.sh
 ```
+
+Run the primary validation-selected spherical-residual experiment over seeds
+2024-2033:
+
+```bash
+GPU_ID=0 bash exec_iemocap_spherical_residual.sh
+```
+
+Run the separately named original-SDT-style test-selected comparison:
+
+```bash
+GPU_ID=0 bash exec_iemocap_spherical_residual_test_selected.sh
+```
+
+Run the validation-selected alpha sensitivity analysis for
+`alpha in {0.05, 0.1, 0.2}`:
+
+```bash
+GPU_ID=0 bash exec_iemocap_spherical_alpha_sweep.sh
+```
+
+The predefined main initialization is `0.1`; the sweep never selects alpha
+using test performance.
 
 Run all six modes over ten initialization seeds and aggregate them:
 
@@ -390,6 +472,14 @@ Learnable-angle runs additionally contain:
 - prior angles, learned angles, gaps, offsets, and target similarities in
   the checkpoint and summary.
 
+Spherical-residual runs additionally contain:
+
+- `residual_gate_history.csv` with all 18 effective gates per epoch;
+- `spherical_residual_diagnostics.json` with per-split norm and angular
+  movement statistics for every attention and MLP update;
+- residual type, gate initialization, and selected gate values in the
+  checkpoint and summary.
+
 The three `features_*.npz` files follow the established
 `results/alv_IEMOCAP_20260630_054819/features_train.npz` contract:
 
@@ -425,9 +515,11 @@ SDT has no separate sentiment head. For schema compatibility,
 IDs: sad/angry/frustrated are negative (`0`), neutral is neutral (`1`), and
 happy/excited are positive (`2`).
 
-All three files are exported after restoring the best validation checkpoint.
-The training export uses a deterministic, non-shuffled loader; it does not
-perform an optimizer step. Test inference still occurs exactly once.
+All three files are exported after restoring the selected checkpoint. The
+training export uses a deterministic, non-shuffled loader and performs no
+optimizer step. Under validation selection, test inference occurs exactly
+once. Under original-SDT-style test selection, test is evaluated every epoch
+and once more from the restored selected checkpoint for aligned artifacts.
 
 Run `aggregate_results.py` to create per-seed, mean/std, and paired-difference
 tables:
@@ -442,10 +534,10 @@ python aggregate_results.py --output-dir results
 python -m unittest discover -s tests -v
 ```
 
-The tests cover fixed and learnable circular targets, ordered positive gaps,
-angle gradients and checkpoint restoration, padding masks, self-distillation,
-the fixed split, fusion-head modes, and original SDT feature/logit parity for
-the linear control.
+The tests cover fixed and learnable circular targets, spherical residual
+norms, padding, gate gradients and restoration, ordered positive angle gaps,
+self-distillation, split lifecycles, fusion-head modes, and original SDT
+feature/logit parity for the standard-residual linear control.
 
 ## References
 

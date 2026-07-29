@@ -41,6 +41,7 @@ from model import (
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
     LEARNABLE_ANGLE_MODES,
+    SDT_RESIDUAL_UPDATES,
     SDTCSEModel,
 )
 
@@ -387,6 +388,37 @@ def run_epoch(
     return result
 
 
+def collect_split_with_residual_diagnostics(
+    model,
+    dataloader,
+    device,
+    class_weights,
+    circular_loss_function,
+    args,
+):
+    model.enable_spherical_residual_diagnostics(
+        enabled=True,
+        reset=True,
+    )
+    try:
+        result = run_epoch(
+            model,
+            dataloader,
+            device,
+            class_weights,
+            circular_loss_function,
+            args,
+            collect_outputs=True,
+        )
+        diagnostics = model.spherical_residual_diagnostics()
+    finally:
+        model.enable_spherical_residual_diagnostics(
+            enabled=False,
+            reset=False,
+        )
+    return result, diagnostics
+
+
 def emotion_to_sentiment(emotion_labels):
     emotion_labels = np.asarray(emotion_labels, dtype=np.int64)
     if emotion_labels.size:
@@ -587,6 +619,9 @@ def experiment_directory_name(
     circular_geometry="equal",
     angle_weight=0.0,
     selection_protocol="validation",
+    sdt_residual_update="standard",
+    spherical_attention_alpha_init=0.1,
+    spherical_mlp_alpha_init=0.1,
 ):
     if mode in LEARNABLE_ANGLE_MODES:
         condition = "{}_{}_lambda_{}_angle_{}".format(
@@ -607,6 +642,11 @@ def experiment_directory_name(
         )
     else:
         condition = mode
+    if sdt_residual_update == "spherical":
+        condition += "_spherical_residual_a{}_m{}".format(
+            format(float(spherical_attention_alpha_init), "g"),
+            format(float(spherical_mlp_alpha_init), "g"),
+        )
     if selection_protocol == "test":
         condition += "_test_selected"
     return condition
@@ -711,24 +751,49 @@ def angle_history_row(epoch, model, fixed_class_angles):
     return row
 
 
+def spherical_residual_gate_payload(model):
+    return {
+        name: float(alpha.detach().cpu().item())
+        for name, alpha in model.spherical_residual_gate_state().items()
+    }
+
+
+def spherical_residual_history_row(epoch, model):
+    gates = spherical_residual_gate_payload(model)
+    if not gates:
+        return None
+    row = {"epoch": int(epoch)}
+    for name, alpha in gates.items():
+        column = "{}_alpha".format(
+            name.replace(".", "_")
+        )
+        row[column] = alpha
+    return row
+
+
 def build_optimizer(model, learning_rate, weight_decay):
-    if model.circular_angle_learner is None:
+    no_decay_parameters = []
+    if model.circular_angle_learner is not None:
+        no_decay_parameters.extend(
+            model.circular_angle_learner.parameters()
+        )
+    no_decay_parameters.extend(
+        model.spherical_residual_parameters()
+    )
+    if not no_decay_parameters:
         return optim.Adam(
             model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay,
         )
 
-    angle_parameters = list(
-        model.circular_angle_learner.parameters()
-    )
-    angle_parameter_ids = {
-        id(parameter) for parameter in angle_parameters
+    no_decay_parameter_ids = {
+        id(parameter) for parameter in no_decay_parameters
     }
     base_parameters = [
         parameter
         for parameter in model.parameters()
-        if id(parameter) not in angle_parameter_ids
+        if id(parameter) not in no_decay_parameter_ids
     ]
     return optim.Adam(
         [
@@ -737,7 +802,7 @@ def build_optimizer(model, learning_rate, weight_decay):
                 "weight_decay": weight_decay,
             },
             {
-                "params": angle_parameters,
+                "params": no_decay_parameters,
                 "weight_decay": 0.0,
             },
         ],
@@ -809,6 +874,14 @@ def save_checkpoint(
             if selection_metrics is not None
             else validation_metrics
         ),
+        "sdt_residual_update": args.sdt_residual_update,
+        "spherical_attention_alpha_init": (
+            args.spherical_attention_alpha_init
+        ),
+        "spherical_mlp_alpha_init": args.spherical_mlp_alpha_init,
+        "spherical_residual_gates": (
+            spherical_residual_gate_payload(model)
+        ),
     }
     torch.save(payload, path)
 
@@ -845,6 +918,23 @@ def validate_arguments(args):
                 SELECTION_PROTOCOLS
             )
         )
+    if args.sdt_residual_update not in SDT_RESIDUAL_UPDATES:
+        raise ValueError(
+            "--sdt-residual-update must be one of {}".format(
+                SDT_RESIDUAL_UPDATES
+            )
+        )
+    for name in (
+        "spherical_attention_alpha_init",
+        "spherical_mlp_alpha_init",
+    ):
+        value = getattr(args, name)
+        if not 0.0 < value < 1.0:
+            raise ValueError(
+                "--{} must be strictly between 0 and 1".format(
+                    name.replace("_", "-")
+                )
+            )
     for name in (
         "fusion_ce_weight",
         "unimodal_ce_weight",
@@ -905,6 +995,9 @@ def train_and_test(args):
             args.circular_geometry,
             args.angle_weight,
             args.selection_protocol,
+            args.sdt_residual_update,
+            args.spherical_attention_alpha_init,
+            args.spherical_mlp_alpha_init,
         ),
         "seed_{}".format(args.seed),
     )
@@ -943,6 +1036,11 @@ def train_and_test(args):
         projection_dropout=args.projection_dropout,
         initial_cosine_scale=args.initial_cosine_scale,
         initial_class_angles=prior_class_angles,
+        sdt_residual_update=args.sdt_residual_update,
+        spherical_attention_alpha_init=(
+            args.spherical_attention_alpha_init
+        ),
+        spherical_mlp_alpha_init=args.spherical_mlp_alpha_init,
     ).to(device)
     class_weights = iemocap_class_weights(device=device)
     initial_angle_payload = angle_state_payload(
@@ -982,6 +1080,7 @@ def train_and_test(args):
     best_selection = None
     epoch_rows = []
     angle_history_rows = []
+    residual_gate_history_rows = []
     selection_name = (
         "testing"
         if args.selection_protocol == "test"
@@ -1028,6 +1127,17 @@ def train_and_test(args):
             write_rows(
                 os.path.join(run_dir, "angle_history.csv"),
                 angle_history_rows,
+            )
+        residual_history = spherical_residual_history_row(
+            epoch, model
+        )
+        if residual_history is not None:
+            residual_gate_history_rows.append(residual_history)
+            write_rows(
+                os.path.join(
+                    run_dir, "residual_gate_history.csv"
+                ),
+                residual_gate_history_rows,
             )
         print(
             "epoch={} train_total={:.6f} train_wf1={:.4f} "
@@ -1096,36 +1206,78 @@ def train_and_test(args):
             },
         )
     with torch.no_grad():
-        selected_training = run_epoch(
+        (
+            selected_training,
+            training_residual_diagnostics,
+        ) = collect_split_with_residual_diagnostics(
             model,
             loaders["training_export"],
             device,
             class_weights,
             circular_loss_function,
             args,
-            collect_outputs=True,
         )
-        selected_validation = (
-            run_epoch(
+        if loaders["validation"] is not None:
+            (
+                selected_validation,
+                validation_residual_diagnostics,
+            ) = collect_split_with_residual_diagnostics(
                 model,
                 loaders["validation"],
                 device,
                 class_weights,
                 circular_loss_function,
                 args,
-                collect_outputs=True,
             )
-            if loaders["validation"] is not None
-            else None
-        )
-        testing = run_epoch(
+        else:
+            selected_validation = None
+            validation_residual_diagnostics = None
+        (
+            testing,
+            testing_residual_diagnostics,
+        ) = collect_split_with_residual_diagnostics(
             model,
             loaders["testing"],
             device,
             class_weights,
             circular_loss_function,
             args,
-            collect_outputs=True,
+        )
+
+    residual_diagnostics = None
+    if args.sdt_residual_update == "spherical":
+        residual_diagnostics = {
+            "selected_epoch": best_epoch,
+            "sdt_residual_update": args.sdt_residual_update,
+            "spherical_attention_alpha_init": (
+                args.spherical_attention_alpha_init
+            ),
+            "spherical_mlp_alpha_init": (
+                args.spherical_mlp_alpha_init
+            ),
+            "gates": spherical_residual_gate_payload(model),
+            "splits": {
+                "training": {
+                    "available": True,
+                    "updates": training_residual_diagnostics,
+                },
+                "validation": {
+                    "available": (
+                        validation_residual_diagnostics is not None
+                    ),
+                    "updates": validation_residual_diagnostics,
+                },
+                "testing": {
+                    "available": True,
+                    "updates": testing_residual_diagnostics,
+                },
+            },
+        }
+        write_json(
+            os.path.join(
+                run_dir, "spherical_residual_diagnostics.json"
+            ),
+            residual_diagnostics,
         )
 
     training_metrics = public_metrics(selected_training)
@@ -1238,6 +1390,19 @@ def train_and_test(args):
             )
     summary = {
         "experiment_mode": args.experiment_mode,
+        "sdt_residual_update": args.sdt_residual_update,
+        "spherical_attention_alpha_init": (
+            args.spherical_attention_alpha_init
+        ),
+        "spherical_mlp_alpha_init": args.spherical_mlp_alpha_init,
+        "spherical_residual_gates": (
+            spherical_residual_gate_payload(model)
+        ),
+        "spherical_residual_diagnostics_path": (
+            "spherical_residual_diagnostics.json"
+            if args.sdt_residual_update == "spherical"
+            else None
+        ),
         "selection_protocol": args.selection_protocol,
         "selection_split": selection_name,
         "selection_metrics": best_selection,
@@ -1300,6 +1465,25 @@ def build_argument_parser():
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--n-head", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument(
+        "--sdt-residual-update",
+        choices=SDT_RESIDUAL_UPDATES,
+        default="standard",
+        help=(
+            "standard preserves original SDT residual additions; "
+            "spherical uses learned normalized interpolation"
+        ),
+    )
+    parser.add_argument(
+        "--spherical-attention-alpha-init",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--spherical-mlp-alpha-init",
+        type=float,
+        default=0.1,
+    )
     parser.add_argument("--embedding-dim", type=int, default=256)
     parser.add_argument("--projection-dropout", type=float, default=0.1)
     parser.add_argument(

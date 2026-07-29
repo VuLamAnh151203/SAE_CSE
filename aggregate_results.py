@@ -58,9 +58,63 @@ def condition_name(summary):
         )
     else:
         condition = mode
+    if summary.get("sdt_residual_update", "standard") == "spherical":
+        condition += "_spherical_residual_a{}_m{}".format(
+            format(
+                float(
+                    summary.get(
+                        "spherical_attention_alpha_init", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get("spherical_mlp_alpha_init", 0.1)
+                ),
+                "g",
+            ),
+        )
     if summary.get("selection_protocol", "validation") == "test":
         condition += "_test_selected"
     return condition
+
+
+def residual_gate_statistics(summary):
+    gates = summary.get("spherical_residual_gates") or {}
+    attention = np.asarray(
+        [
+            value
+            for name, value in gates.items()
+            if name.endswith("attention_update")
+        ],
+        dtype=np.float64,
+    )
+    mlp = np.asarray(
+        [
+            value
+            for name, value in gates.items()
+            if name.endswith("mlp_update")
+        ],
+        dtype=np.float64,
+    )
+    all_values = np.concatenate(
+        [values for values in (attention, mlp) if values.size]
+    ) if attention.size or mlp.size else np.asarray([], dtype=np.float64)
+    return {
+        "final_attention_alpha_mean": (
+            float(attention.mean()) if attention.size else None
+        ),
+        "final_mlp_alpha_mean": (
+            float(mlp.mean()) if mlp.size else None
+        ),
+        "final_alpha_min": (
+            float(all_values.min()) if all_values.size else None
+        ),
+        "final_alpha_max": (
+            float(all_values.max()) if all_values.size else None
+        ),
+    }
 
 
 def aggregate(output_dir):
@@ -80,9 +134,13 @@ def aggregate(output_dir):
             "condition": condition,
             "seed": summary["seed"],
             "selected_epoch": summary["selected_epoch"],
+            "sdt_residual_update": summary.get(
+                "sdt_residual_update", "standard"
+            ),
         }
         for metric in METRICS:
             row["test_{}".format(metric)] = summary["test"].get(metric)
+        row.update(residual_gate_statistics(summary))
         rows.append(row)
         grouped.setdefault(condition, []).append(row)
 
@@ -104,6 +162,26 @@ def aggregate(output_dir):
                     row["test_{}".format(metric)]
                     for row in condition_rows
                     if row["test_{}".format(metric)] is not None
+                ],
+                dtype=np.float64,
+            )
+            item["{}_mean".format(metric)] = (
+                float(values.mean()) if values.size else ""
+            )
+            item["{}_std".format(metric)] = (
+                float(values.std()) if values.size else ""
+            )
+        for metric in (
+            "final_attention_alpha_mean",
+            "final_mlp_alpha_mean",
+            "final_alpha_min",
+            "final_alpha_max",
+        ):
+            values = np.asarray(
+                [
+                    row[metric]
+                    for row in condition_rows
+                    if row[metric] is not None
                 ],
                 dtype=np.float64,
             )
