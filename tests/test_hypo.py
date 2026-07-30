@@ -26,15 +26,19 @@ from losses import (  # noqa: E402
 )
 from model import (  # noqa: E402
     CIRCULAR_CSE_MODES,
+    CONFUSION_GAP_MODES,
     HYPO_ALIGNMENT_MODES,
     HYPO_MODES,
+    LEARNABLE_ANGLE_MODES,
     SDTCSEModel,
+    STABILIZED_HYPO_MODES,
 )
 from train import (  # noqa: E402
     build_argument_parser,
     build_bilevel_angle_optimizer,
     bilevel_angle_step,
     experiment_directory_name,
+    hypo_schedule_scale,
     save_checkpoint,
     save_hypo_artifacts,
     validate_arguments,
@@ -343,6 +347,37 @@ class HypoPrototypeLossTest(unittest.TestCase):
         for key, value in criterion.state_dict().items():
             self.assertTrue(torch.equal(value, before[key]))
 
+    def test_detached_circle_target_updates_embeddings_not_angles(self):
+        criterion = HypoPrototypeLoss(
+            6, 3, temperature=0.2, prototype_momentum=0.5
+        )
+        criterion(
+            six_embeddings(),
+            torch.arange(6),
+            update_prototypes=True,
+        )
+        embeddings = (six_embeddings() + 0.2).requires_grad_()
+        class_angles = build_iemocap_angles().requires_grad_()
+        outputs = minimal_outputs(embeddings)
+        outputs["class_angles"] = class_angles
+        losses = compute_sdt_cse_losses(
+            outputs,
+            torch.arange(6).reshape(1, 6),
+            torch.ones(1, 6),
+            torch.ones(6),
+            hypo_loss_function=criterion,
+            hypo_loss_weight=1.0,
+            hypo_compactness_weight=0.0,
+            use_batch_hypo_candidates=True,
+            hypo_alignment_enabled=True,
+            hypo_alignment_weight=1.0,
+            detach_hypo_alignment_target=True,
+        )
+        losses["total_loss"].backward()
+        self.assertIsNone(class_angles.grad)
+        self.assertTrue(torch.isfinite(embeddings.grad).all())
+        self.assertGreater(float(embeddings.grad.abs().sum()), 0.0)
+
 
 class HypoIntegrationTest(unittest.TestCase):
     @staticmethod
@@ -525,6 +560,110 @@ class HypoIntegrationTest(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 validate_arguments(invalid)
+
+    def test_stabilized_old_angle_mode_defaults_and_schedule(self):
+        mode = (
+            "sdt_cse_learnable_angles_confusion_gap_hypo_aligned"
+        )
+        for collection in (
+            HYPO_MODES,
+            HYPO_ALIGNMENT_MODES,
+            STABILIZED_HYPO_MODES,
+            CIRCULAR_CSE_MODES,
+            CONFUSION_GAP_MODES,
+            LEARNABLE_ANGLE_MODES,
+        ):
+            self.assertIn(mode, collection)
+
+        parser = build_argument_parser()
+        args = parser.parse_args(["--experiment-mode", mode])
+        validate_arguments(args)
+        self.assertEqual(args.circular_geometry, "equal")
+        self.assertEqual(args.circular_weight, 0.1)
+        self.assertEqual(args.angle_weight, 0.1)
+        self.assertEqual(args.confusion_gap_weight, 0.1)
+        self.assertEqual(args.minimum_confusion_gap_degrees, 75.0)
+        self.assertEqual(args.hypo_loss_weight, 0.02)
+        self.assertEqual(args.hypo_compactness_weight, 1.0)
+        self.assertEqual(args.hypo_alignment_weight, 0.1)
+        self.assertEqual(args.hypo_temperature, 0.2)
+        self.assertEqual(args.hypo_prototype_momentum, 0.9)
+        self.assertEqual(args.hypo_warmup_epochs, 10)
+        self.assertEqual(args.hypo_ramp_epochs, 20)
+
+        self.assertEqual(
+            [
+                hypo_schedule_scale(
+                    epoch,
+                    args.hypo_warmup_epochs,
+                    args.hypo_ramp_epochs,
+                )
+                for epoch in (1, 10, 11, 20, 30, 31)
+            ],
+            [0.0, 0.0, 0.05, 0.5, 1.0, 1.0],
+        )
+
+        model = SDTCSEModel(
+            d_text=5,
+            d_visual=4,
+            d_audio=3,
+            n_head=2,
+            n_classes=6,
+            hidden_dim=8,
+            n_speakers=2,
+            dropout=0.0,
+            experiment_mode=mode,
+            embedding_dim=3,
+            projection_dropout=0.0,
+            initial_class_angles=build_iemocap_angles(),
+        )
+        self.assertIsNotNone(model.circular_angle_learner)
+        self.assertEqual(
+            model.circular_angle_learner.raw_gaps.numel(), 6
+        )
+        self.assertIsNotNone(model.fusion_projector)
+        self.assertIsNotNone(model.t_output_layer)
+
+        condition = experiment_directory_name(
+            mode,
+            args.circular_weight,
+            args.circular_geometry,
+            angle_weight=args.angle_weight,
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
+            ),
+            confusion_gap_weight=args.confusion_gap_weight,
+            hypo_loss_weight=args.hypo_loss_weight,
+            hypo_compactness_weight=args.hypo_compactness_weight,
+            hypo_alignment_weight=args.hypo_alignment_weight,
+            hypo_temperature=args.hypo_temperature,
+            hypo_prototype_momentum=args.hypo_prototype_momentum,
+            hypo_warmup_epochs=args.hypo_warmup_epochs,
+            hypo_ramp_epochs=args.hypo_ramp_epochs,
+        )
+        summary = {
+            "experiment_mode": mode,
+            "circular_geometry": args.circular_geometry,
+            "circular_weight": args.circular_weight,
+            "angle_weight": args.angle_weight,
+            "minimum_confusion_gap_degrees": (
+                args.minimum_confusion_gap_degrees
+            ),
+            "confusion_gap_weight": args.confusion_gap_weight,
+            "hypo_loss_weight": args.hypo_loss_weight,
+            "hypo_compactness_weight": (
+                args.hypo_compactness_weight
+            ),
+            "hypo_alignment_weight": args.hypo_alignment_weight,
+            "hypo_temperature": args.hypo_temperature,
+            "hypo_prototype_momentum": (
+                args.hypo_prototype_momentum
+            ),
+            "hypo_warmup_epochs": args.hypo_warmup_epochs,
+            "hypo_ramp_epochs": args.hypo_ramp_epochs,
+        }
+        self.assertEqual(condition_name(summary), condition)
+        self.assertIn("_hl0.02_c1_a0.1_t0.2_pm0.9_wu10_r20", condition)
 
     def test_aligned_bilevel_mode_keeps_both_geometries(self):
         mode = "sdt_cse_bilevel_confusion_gap_hypo_aligned"

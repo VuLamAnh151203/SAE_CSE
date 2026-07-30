@@ -15,6 +15,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
     "sdt_cse_confusion_margin",
     "sdt_cse_bilevel_confusion_gap",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
@@ -22,7 +23,11 @@ EXPERIMENT_MODES = (
 )
 PRIOR_FREE_HYPO_MODES = ("sdt_hypo",)
 HYPO_ALIGNMENT_MODES = (
+    "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
+)
+STABILIZED_HYPO_MODES = (
+    "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
 )
 HYPO_MODES = (
     *PRIOR_FREE_HYPO_MODES,
@@ -35,6 +40,7 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
     "sdt_cse_confusion_margin",
     "sdt_cse_bilevel_confusion_gap",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
@@ -48,6 +54,7 @@ ALL_MODAL_CSE_MODES = ("sdt_cse_all_modal_cse",)
 FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
 CONFUSION_GAP_MODES = (
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
 )
 CONFUSION_MARGIN_MODES = (
     "sdt_cse_confusion_margin",

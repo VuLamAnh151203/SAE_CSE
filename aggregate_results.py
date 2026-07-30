@@ -269,6 +269,55 @@ def condition_name(summary):
                 "g",
             ),
         )
+    elif (
+        mode
+        == "sdt_cse_learnable_angles_confusion_gap_hypo_aligned"
+    ):
+        condition = (
+            "{}_{}_l{}_ang{}_g{}_gw{}_hl{}_c{}_a{}_t{}_"
+            "pm{}_wu{}_r{}"
+        ).format(
+            mode,
+            summary.get("circular_geometry", "equal"),
+            format(float(summary["circular_weight"]), "g"),
+            format(float(summary.get("angle_weight", 0.1)), "g"),
+            format(
+                float(
+                    summary.get(
+                        "minimum_confusion_gap_degrees", 75.0
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(summary.get("confusion_gap_weight", 0.1)),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_loss_weight", 0.02)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_compactness_weight", 1.0)
+                ),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_alignment_weight", 0.1)),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_temperature", 0.2)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_prototype_momentum", 0.9)
+                ),
+                "g",
+            ),
+            int(summary.get("hypo_warmup_epochs", 10)),
+            int(summary.get("hypo_ramp_epochs", 20)),
+        )
     elif mode == "sdt_cse_learnable_angles_confusion_gap":
         geometry = summary.get("circular_geometry", "equal")
         condition = (
@@ -412,6 +461,18 @@ def aggregate(output_dir):
             "hypo_alignment_weight": summary.get(
                 "hypo_alignment_weight"
             ),
+            "hypo_warmup_epochs": summary.get(
+                "hypo_warmup_epochs"
+            ),
+            "hypo_ramp_epochs": summary.get(
+                "hypo_ramp_epochs"
+            ),
+            "selected_hypo_schedule_scale": summary.get(
+                "selected_hypo_schedule_scale"
+            ),
+            "hypo_alignment_target_detached": summary.get(
+                "hypo_alignment_target_detached"
+            ),
             "hypo_initialized_classes": summary.get(
                 "hypo_initialized_classes"
             ),
@@ -479,6 +540,15 @@ def aggregate(output_dir):
             "hypo_alignment_weight": condition_rows[0].get(
                 "hypo_alignment_weight"
             ),
+            "hypo_warmup_epochs": condition_rows[0].get(
+                "hypo_warmup_epochs"
+            ),
+            "hypo_ramp_epochs": condition_rows[0].get(
+                "hypo_ramp_epochs"
+            ),
+            "hypo_alignment_target_detached": condition_rows[
+                0
+            ].get("hypo_alignment_target_detached"),
         }
         for metric in METRICS:
             values = np.asarray(

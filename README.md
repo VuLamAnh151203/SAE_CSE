@@ -19,6 +19,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
 | `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
+| `sdt_cse_learnable_angles_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Old six-angle confusion-gap objective + stabilized circle-aligned HYPO |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 | `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
 | `sdt_cse_bilevel_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Bilevel circular gap + circle-aligned HYPO prototypes |
@@ -58,6 +59,10 @@ The comparisons have distinct purposes:
 - `sdt_cse_learnable_angles_confusion_gap - sdt_cse_learnable_angles`
   measures whether explicitly widening happy–excited and
   angry–frustrated improves their classification.
+
+- `sdt_cse_learnable_angles_confusion_gap_hypo_aligned -
+  sdt_cse_learnable_angles_confusion_gap` isolates stabilized,
+  circle-aware HYPO while preserving the old six-angle learner.
 
 - `sdt_cse_confusion_margin - sdt_cse` measures the combined effect of a
   fixed constrained geometry, stronger CircularCSE supervision for the two
@@ -252,6 +257,30 @@ confusion_gap_weight * (
 The ordered positive-gap parameterization remains unchanged, so the circular
 order and total circumference are preserved. Increasing these two gaps
 redistributes the remaining circumference across the other four gaps.
+
+`sdt_cse_learnable_angles_confusion_gap_hypo_aligned` preserves that entire
+objective and adds:
+
+```text
+hypo_loss_weight(epoch) * (
+  hypo_compactness_weight * compactness
+  + hypo_alignment_weight * prototype-to-circle alignment
+)
+```
+
+Its mode-specific defaults are `hypo_loss_weight=0.02`,
+`hypo_compactness_weight=1`, `hypo_alignment_weight=0.1`,
+`hypo_temperature=0.2`, and prototype momentum `0.9`. Prototypes update
+during a 10-epoch HYPO-loss warm-up. The HYPO weight then ramps linearly to
+its configured value over 20 epochs.
+
+The alignment target is detached: alignment moves fusion embeddings and
+their differentiable batch prototypes toward the learned circular
+similarity matrix without letting noisy early prototypes directly drag the
+angle parameters. The angles still learn normally through CircularCSE,
+prior-angle regularization, and the minimum confusion-gap penalty. As HYPO
+changes the embeddings, CircularCSE provides the indirect coupling back to
+the six-angle learner.
 
 For `sdt_cse_confusion_margin`, the class angles are fixed rather than
 learned. In circular order, the six consecutive gaps are:
@@ -565,6 +594,17 @@ python train.py \
   --confusion-gap-weight 0.1 \
   --seed 2024
 python train.py \
+  --experiment-mode sdt_cse_learnable_angles_confusion_gap_hypo_aligned \
+  --selection-protocol validation \
+  --circular-geometry equal \
+  --circular-weight 0.1 \
+  --angle-weight 0.1 \
+  --minimum-confusion-gap-degrees 75 \
+  --confusion-gap-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+python train.py \
   --experiment-mode sdt_cse_confusion_margin \
   --selection-protocol validation \
   --circular-geometry confusion_separated \
@@ -753,6 +793,17 @@ This launcher uses the requested 50-150 degree range, 90-degree
 initialization, and training-only EMA prototypes. At the 150-degree upper
 bound, the four remaining circular gaps are 15 degrees; treat this wide
 range as a sensitivity experiment.
+
+Run the stabilized HYPO augmentation of the old six-angle confusion-gap
+mode over seeds 2024-2033:
+
+```bash
+GPU_ID=0 \
+  bash exec_iemocap_learnable_angles_confusion_gap_hypo_aligned.sh
+```
+
+The launcher uses the stabilized defaults explicitly and keeps validation
+weighted F1 selection with fusion CE tie-breaking.
 
 Run the validation-learned six-gap experiment over seeds 2024-2033:
 

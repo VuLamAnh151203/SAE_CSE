@@ -59,6 +59,7 @@ from model import (
     PRIOR_FREE_HYPO_MODES,
     SDT_RESIDUAL_UPDATES,
     SDTCSEModel,
+    STABILIZED_HYPO_MODES,
 )
 
 
@@ -116,6 +117,60 @@ BILEVEL_METRIC_NAMES = (
     "bilevel_gap_change_l2_degrees",
     "bilevel_updates",
 )
+
+STANDARD_HYPO_DEFAULTS = {
+    "hypo_loss_weight": 0.1,
+    "hypo_compactness_weight": 2.0,
+    "hypo_alignment_weight": 1.0,
+    "hypo_temperature": 0.1,
+    "hypo_prototype_momentum": 0.95,
+    "hypo_warmup_epochs": 0,
+    "hypo_ramp_epochs": 0,
+}
+STABILIZED_HYPO_DEFAULTS = {
+    "hypo_loss_weight": 0.02,
+    "hypo_compactness_weight": 1.0,
+    "hypo_alignment_weight": 0.1,
+    "hypo_temperature": 0.2,
+    "hypo_prototype_momentum": 0.9,
+    "hypo_warmup_epochs": 10,
+    "hypo_ramp_epochs": 20,
+}
+
+
+def apply_hypo_mode_defaults(args):
+    defaults = (
+        STABILIZED_HYPO_DEFAULTS
+        if args.experiment_mode in STABILIZED_HYPO_MODES
+        else STANDARD_HYPO_DEFAULTS
+    )
+    for name, value in defaults.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
+
+
+def hypo_schedule_scale(
+    epoch,
+    warmup_epochs,
+    ramp_epochs,
+    enabled=True,
+):
+    if int(epoch) != epoch or epoch < 1:
+        raise ValueError("epoch must be a positive integer")
+    if int(warmup_epochs) != warmup_epochs or warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be a nonnegative integer")
+    if int(ramp_epochs) != ramp_epochs or ramp_epochs < 0:
+        raise ValueError("ramp_epochs must be a nonnegative integer")
+    if not enabled:
+        return 1.0
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return 1.0
+    return min(
+        1.0,
+        float(epoch - warmup_epochs) / float(ramp_epochs),
+    )
 
 
 def uses_validation_gap_learning(args):
@@ -302,7 +357,12 @@ def _compute_batch_losses(
     hypo_loss_function=None,
     update_hypo_prototypes=False,
     use_batch_hypo_candidates=None,
+    hypo_loss_scale=1.0,
 ):
+    if not np.isfinite(hypo_loss_scale) or not (
+        0.0 <= hypo_loss_scale <= 1.0
+    ):
+        raise ValueError("hypo_loss_scale must be finite and in [0, 1]")
     outputs = _model_forward(model, batch)
     losses = compute_sdt_cse_losses(
         outputs,
@@ -327,7 +387,9 @@ def _compute_batch_losses(
             args.confusion_classification_margin
         ),
         hypo_loss_function=hypo_loss_function,
-        hypo_loss_weight=args.hypo_loss_weight,
+        hypo_loss_weight=(
+            args.hypo_loss_weight * float(hypo_loss_scale)
+        ),
         hypo_compactness_weight=(
             args.hypo_compactness_weight
         ),
@@ -337,6 +399,9 @@ def _compute_batch_losses(
             model.experiment_mode in HYPO_ALIGNMENT_MODES
         ),
         hypo_alignment_weight=args.hypo_alignment_weight,
+        detach_hypo_alignment_target=(
+            model.experiment_mode in STABILIZED_HYPO_MODES
+        ),
     )
     gap_prior_regularization = outputs["fusion_logits"].sum() * 0.0
     if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
@@ -601,6 +666,7 @@ def run_epoch(
     bilevel_angle_optimizer=None,
     bilevel_validation_batches=None,
     hypo_loss_function=None,
+    hypo_loss_scale=1.0,
 ):
     training = optimizer is not None
     model.train(training)
@@ -655,6 +721,7 @@ def run_epoch(
                 args,
                 hypo_loss_function=hypo_loss_function,
                 update_hypo_prototypes=training,
+                hypo_loss_scale=hypo_loss_scale,
             )
             if training:
                 losses["total_loss"].backward()
@@ -799,6 +866,16 @@ def run_epoch(
         if hypo_loss_function is None
         else hypo_loss_function.prototype_coverage
     )
+    result["hypo_schedule_scale"] = (
+        None
+        if hypo_loss_function is None
+        else float(hypo_loss_scale)
+    )
+    result["hypo_effective_loss_weight"] = (
+        None
+        if hypo_loss_function is None
+        else float(args.hypo_loss_weight * hypo_loss_scale)
+    )
     scale = model.effective_cosine_scale
     result["cosine_scale"] = (
         None if scale is None else float(scale.detach().cpu().item())
@@ -859,6 +936,7 @@ def collect_split_with_residual_diagnostics(
     circular_loss_function,
     args,
     hypo_loss_function=None,
+    hypo_loss_scale=1.0,
 ):
     model.enable_spherical_residual_diagnostics(
         enabled=True,
@@ -874,6 +952,7 @@ def collect_split_with_residual_diagnostics(
             args,
             collect_outputs=True,
             hypo_loss_function=hypo_loss_function,
+            hypo_loss_scale=hypo_loss_scale,
         )
         diagnostics = model.spherical_residual_diagnostics()
     finally:
@@ -1015,6 +1094,8 @@ def public_metrics(result):
         "visual_cosine_scale",
         "hypo_initialized_classes",
         "hypo_prototype_coverage",
+        "hypo_schedule_scale",
+        "hypo_effective_loss_weight",
     ]
     return {key: result.get(key) for key in keys}
 
@@ -1090,6 +1171,19 @@ def save_hypo_artifacts(
         ),
         "hypo_alignment_weight": float(
             args.hypo_alignment_weight
+        ),
+        "hypo_warmup_epochs": int(args.hypo_warmup_epochs),
+        "hypo_ramp_epochs": int(args.hypo_ramp_epochs),
+        "selected_hypo_schedule_scale": hypo_schedule_scale(
+            selected_epoch,
+            args.hypo_warmup_epochs,
+            args.hypo_ramp_epochs,
+            enabled=(
+                args.experiment_mode in STABILIZED_HYPO_MODES
+            ),
+        ),
+        "alignment_target_detached": (
+            args.experiment_mode in STABILIZED_HYPO_MODES
         ),
     }
     if target_similarity is not None:
@@ -1213,6 +1307,8 @@ def experiment_directory_name(
     hypo_temperature=0.1,
     hypo_prototype_momentum=0.95,
     hypo_alignment_weight=1.0,
+    hypo_warmup_epochs=0,
+    hypo_ramp_epochs=0,
 ):
     if mode in PRIOR_FREE_HYPO_MODES:
         condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
@@ -1221,6 +1317,25 @@ def experiment_directory_name(
             format(float(hypo_compactness_weight), "g"),
             format(float(hypo_temperature), "g"),
             format(float(hypo_prototype_momentum), "g"),
+        )
+    elif mode in STABILIZED_HYPO_MODES:
+        condition = (
+            "{}_{}_l{}_ang{}_g{}_gw{}_hl{}_c{}_a{}_t{}_"
+            "pm{}_wu{}_r{}"
+        ).format(
+            mode,
+            circular_geometry,
+            format(float(circular_weight), "g"),
+            format(float(angle_weight), "g"),
+            format(float(minimum_confusion_gap_degrees), "g"),
+            format(float(confusion_gap_weight), "g"),
+            format(float(hypo_loss_weight), "g"),
+            format(float(hypo_compactness_weight), "g"),
+            format(float(hypo_alignment_weight), "g"),
+            format(float(hypo_temperature), "g"),
+            format(float(hypo_prototype_momentum), "g"),
+            int(hypo_warmup_epochs),
+            int(hypo_ramp_epochs),
         )
     elif mode in HYPO_ALIGNMENT_MODES:
         condition = (
@@ -1877,6 +1992,19 @@ def save_checkpoint(
             args.hypo_prototype_momentum
         ),
         "hypo_alignment_weight": args.hypo_alignment_weight,
+        "hypo_warmup_epochs": args.hypo_warmup_epochs,
+        "hypo_ramp_epochs": args.hypo_ramp_epochs,
+        "selected_hypo_schedule_scale": hypo_schedule_scale(
+            epoch,
+            args.hypo_warmup_epochs,
+            args.hypo_ramp_epochs,
+            enabled=(
+                args.experiment_mode in STABILIZED_HYPO_MODES
+            ),
+        ),
+        "hypo_alignment_target_detached": (
+            args.experiment_mode in STABILIZED_HYPO_MODES
+        ),
     }
     if args.experiment_mode in PRIOR_FREE_HYPO_MODES:
         payload.update(
@@ -1920,6 +2048,7 @@ def final_classification_details(labels, predictions):
 
 
 def validate_arguments(args):
+    apply_hypo_mode_defaults(args)
     if args.epochs < 1:
         raise ValueError("--epochs must be positive")
     if args.batch_size < 1:
@@ -1997,6 +2126,18 @@ def validate_arguments(args):
         raise ValueError(
             "--hypo-prototype-momentum must be finite and in [0, 1)"
         )
+    for name in ("hypo_warmup_epochs", "hypo_ramp_epochs"):
+        value = getattr(args, name)
+        if (
+            not np.isfinite(value)
+            or int(value) != value
+            or value < 0
+        ):
+            raise ValueError(
+                "--{} must be a nonnegative integer".format(
+                    name.replace("_", "-")
+                )
+            )
     if args.bilevel_inner_step_size is None:
         args.bilevel_inner_step_size = args.lr
     for name in (
@@ -2149,6 +2290,9 @@ def validate_arguments(args):
         args.hypo_loss_weight = 0.0
     if args.experiment_mode not in HYPO_ALIGNMENT_MODES:
         args.hypo_alignment_weight = 0.0
+    if args.experiment_mode not in STABILIZED_HYPO_MODES:
+        args.hypo_warmup_epochs = 0
+        args.hypo_ramp_epochs = 0
     validated_initial_angles = (
         None
         if args.experiment_mode in PRIOR_FREE_HYPO_MODES
@@ -2233,6 +2377,8 @@ def train_and_test(args):
             args.hypo_temperature,
             args.hypo_prototype_momentum,
             args.hypo_alignment_weight,
+            args.hypo_warmup_epochs,
+            args.hypo_ramp_epochs,
         ),
         "seed_{}".format(args.seed),
     )
@@ -2393,6 +2539,14 @@ def train_and_test(args):
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
+        epoch_hypo_scale = hypo_schedule_scale(
+            epoch,
+            args.hypo_warmup_epochs,
+            args.hypo_ramp_epochs,
+            enabled=(
+                args.experiment_mode in STABILIZED_HYPO_MODES
+            ),
+        )
         training = run_epoch(
             model,
             loaders["training"],
@@ -2404,6 +2558,7 @@ def train_and_test(args):
             bilevel_angle_optimizer=angle_optimizer,
             bilevel_validation_batches=bilevel_validation_batches,
             hypo_loss_function=hypo_loss_function,
+            hypo_loss_scale=epoch_hypo_scale,
         )
         if (
             epoch == 1
@@ -2425,6 +2580,7 @@ def train_and_test(args):
                 circular_loss_function,
                 args,
                 hypo_loss_function=hypo_loss_function,
+                hypo_loss_scale=epoch_hypo_scale,
             )
         row = {
             "epoch": epoch,
@@ -2591,6 +2747,14 @@ def train_and_test(args):
         best_epoch,
         target_similarity=hypo_alignment_target,
     )
+    selected_hypo_scale = hypo_schedule_scale(
+        best_epoch,
+        args.hypo_warmup_epochs,
+        args.hypo_ramp_epochs,
+        enabled=(
+            args.experiment_mode in STABILIZED_HYPO_MODES
+        ),
+    )
     selected_target_similarity = (
         hypo_loss_function.prototype_similarity()
         if (
@@ -2635,6 +2799,7 @@ def train_and_test(args):
             circular_loss_function,
             args,
             hypo_loss_function=hypo_loss_function,
+            hypo_loss_scale=selected_hypo_scale,
         )
         if loaders["validation"] is not None:
             (
@@ -2648,6 +2813,7 @@ def train_and_test(args):
                 circular_loss_function,
                 args,
                 hypo_loss_function=hypo_loss_function,
+                hypo_loss_scale=selected_hypo_scale,
             )
         else:
             selected_validation = None
@@ -2663,6 +2829,7 @@ def train_and_test(args):
             circular_loss_function,
             args,
             hypo_loss_function=hypo_loss_function,
+            hypo_loss_scale=selected_hypo_scale,
         )
 
     residual_diagnostics = None
@@ -2842,6 +3009,12 @@ def train_and_test(args):
             args.hypo_prototype_momentum
         ),
         "hypo_alignment_weight": args.hypo_alignment_weight,
+        "hypo_warmup_epochs": args.hypo_warmup_epochs,
+        "hypo_ramp_epochs": args.hypo_ramp_epochs,
+        "selected_hypo_schedule_scale": selected_hypo_scale,
+        "hypo_alignment_target_detached": (
+            args.experiment_mode in STABILIZED_HYPO_MODES
+        ),
         "hypo_initialized_classes": (
             None
             if hypo_loss_function is None
@@ -2985,34 +3158,66 @@ def build_argument_parser():
     parser.add_argument(
         "--hypo-loss-weight",
         type=float,
-        default=0.1,
-        help="outer HYPO auxiliary-loss weight",
+        default=None,
+        help=(
+            "outer HYPO auxiliary-loss weight; defaults to 0.02 for "
+            "the stabilized learnable-angle mode and 0.1 otherwise"
+        ),
     )
     parser.add_argument(
         "--hypo-compactness-weight",
         type=float,
-        default=2.0,
-        help="compactness weight inside the HYPO objective",
+        default=None,
+        help=(
+            "compactness weight inside HYPO; defaults to 1 for the "
+            "stabilized learnable-angle mode and 2 otherwise"
+        ),
     )
     parser.add_argument(
         "--hypo-temperature",
         type=float,
-        default=0.1,
-        help="temperature for HYPO compactness and dispersion",
+        default=None,
+        help=(
+            "HYPO temperature; defaults to 0.2 for the stabilized "
+            "learnable-angle mode and 0.1 otherwise"
+        ),
     )
     parser.add_argument(
         "--hypo-prototype-momentum",
         type=float,
-        default=0.95,
-        help="EMA momentum for the training-only HYPO prototypes",
+        default=None,
+        help=(
+            "training-only prototype EMA momentum; defaults to 0.9 "
+            "for the stabilized learnable-angle mode and 0.95 "
+            "otherwise"
+        ),
     )
     parser.add_argument(
         "--hypo-alignment-weight",
         type=float,
-        default=1.0,
+        default=None,
         help=(
             "prototype-to-circular-similarity alignment weight "
-            "inside the aligned HYPO objective"
+            "inside aligned HYPO; defaults to 0.1 for the stabilized "
+            "learnable-angle mode and 1 otherwise"
+        ),
+    )
+    parser.add_argument(
+        "--hypo-warmup-epochs",
+        type=int,
+        default=None,
+        help=(
+            "prototype-only warm-up before activating HYPO; defaults "
+            "to 10 only for the stabilized learnable-angle mode"
+        ),
+    )
+    parser.add_argument(
+        "--hypo-ramp-epochs",
+        type=int,
+        default=None,
+        help=(
+            "linear HYPO loss ramp after warm-up; defaults to 20 only "
+            "for the stabilized learnable-angle mode"
         ),
     )
     parser.add_argument(

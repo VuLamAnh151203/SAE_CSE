@@ -732,6 +732,7 @@ def compute_sdt_cse_losses(
     use_batch_hypo_candidates=None,
     hypo_alignment_enabled=False,
     hypo_alignment_weight=0.0,
+    detach_hypo_alignment_target=False,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
@@ -900,6 +901,8 @@ def compute_sdt_cse_losses(
             target_similarity = build_target_similarity(
                 class_angles
             )
+            if detach_hypo_alignment_target:
+                target_similarity = target_similarity.detach()
         hypo_components = hypo_loss_function(
             valid_embeddings,
             valid_labels,
