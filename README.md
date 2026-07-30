@@ -19,6 +19,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
+| `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -56,6 +57,10 @@ The comparisons have distinct purposes:
 - `sdt_cse_confusion_margin - sdt_cse` measures the combined effect of a
   fixed constrained geometry, stronger CircularCSE supervision for the two
   confused pairs, and a direct confusion-aware cosine-classification margin.
+
+- `sdt_cse_bilevel_confusion_gap - sdt_cse_confusion_margin` replaces the
+  fixed gap by one bounded shared gap whose hypergradient comes from
+  validation fusion classification.
 
 ## Internal spherical residuals
 
@@ -234,6 +239,41 @@ weights. Defaults are pair weight `5`, cosine margin `0.1`, and
 classification-margin weight `0.1`. Original unimodal CE and
 self-distillation remain active.
 
+For `sdt_cse_bilevel_confusion_gap`, one shared scalar controls both
+happy-excited and angry-frustrated gaps:
+
+```text
+gap = lower + (upper - lower) * sigmoid(raw_gap)
+other_gap = (360 - 2 * gap) / 4
+```
+
+Defaults are a range of 70-110 degrees and initialization at 90 degrees.
+The ordinary Adam optimizer updates every SDT/model parameter except
+`raw_gap`. A separate zero-weight-decay Adam optimizer updates only
+`raw_gap`.
+
+The gap update uses a one-step DARTS finite-difference hypergradient:
+
+```text
+training objective at temporarily perturbed model weights
+-> Hessian-vector product
+-> validation fusion CE + validation confusion margin
+-> bounded shared gap
+```
+
+The outer validation objective contains no CircularCSE, preventing the
+target angle from merely adapting to the current validation geometry. Model
+weights are never directly stepped using validation gradients. The mode
+requires `--selection-protocol validation`, never accesses test during
+training, and restores the best validation-weighted-F1 checkpoint before
+the single test evaluation.
+
+This method is approximate bilevel optimization because the hypergradient
+differentiates through one virtual SGD step while the actual model optimizer
+is Adam. It performs three additional forward/backward evaluations per
+training minibatch and is therefore substantially slower than fixed-angle
+training.
+
 The emotion order is:
 
 ```text
@@ -264,7 +304,8 @@ architecture:
 
 Fixed-angle modes default to `equal`. The learnable-angle mode defaults to
 `nrc_vad`; either prior can be selected explicitly. The
-`sdt_cse_confusion_margin` mode requires `confusion_separated`.
+`sdt_cse_confusion_margin` and bilevel confusion-gap modes require
+`confusion_separated`; the bilevel mode replaces its fixed angles dynamically.
 
 The nonuniform version uses:
 
@@ -424,6 +465,23 @@ python train.py \
   --device cuda \
   --gpu-id 0 \
   --seed 2024
+python train.py \
+  --experiment-mode sdt_cse_bilevel_confusion_gap \
+  --selection-protocol validation \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-gap-minimum-degrees 70 \
+  --bilevel-gap-maximum-degrees 110 \
+  --bilevel-gap-initial-degrees 90 \
+  --bilevel-angle-learning-rate 0.001 \
+  --bilevel-inner-step-size 0.0001 \
+  --bilevel-hvp-radius 0.01 \
+  --bilevel-outer-confusion-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
 ```
 
 Run standard SDT-CSE with the original SDT test-selection behavior:
@@ -503,6 +561,17 @@ GPU_ID=0 bash exec_iemocap_confusion_margin_sweep.sh
 
 It uses the fixed 75-degree geometry, classification margin `0.1`,
 classification-margin weight `0.1`, and standard SDT residual updates.
+
+Run the validation-learned shared-gap experiment over seeds 2024-2033:
+
+```bash
+GPU_ID=0 bash exec_iemocap_bilevel_confusion_gap.sh
+```
+
+This starts both confusion gaps at 90 degrees and constrains them to
+70-110 degrees. Because each training minibatch requires a validation
+hypergradient calculation, expect this launcher to take several times
+longer than the fixed-angle experiment.
 
 Run all experiment modes over ten initialization seeds and aggregate them:
 
@@ -622,6 +691,15 @@ Confusion-margin runs record the fixed angles, exact pair gaps, target
 similarity matrix, confused-pair CSE weight, cosine-classification margin,
 classification-margin weight, and independently logged
 `confusion_classification_margin` loss in checkpoints and summaries.
+
+Bilevel confusion-gap runs additionally record:
+
+- `bilevel_gap_history.csv` with epoch-level gap and hypergradient metrics;
+- lower, upper, initial, and selected gap values;
+- the outer angle optimizer state in every selected checkpoint;
+- outer validation classification loss, scalar hypergradient, HVP radius,
+  virtual inner-step size, and angle learning rate;
+- the selected checkpoint's dynamic target matrix in geometry reports.
 
 The three `features_*.npz` files follow the established
 `results/alv_IEMOCAP_20260630_054819/features_train.npz` contract:

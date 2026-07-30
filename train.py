@@ -37,9 +37,12 @@ from losses import (
     circular_pair_distances,
     compute_sdt_cse_losses,
     iemocap_class_weights,
+    masked_confusion_classification_margin,
+    masked_weighted_cross_entropy,
     minimum_confusion_gap_regularization,
 )
 from model import (
+    BILEVEL_ANGLE_MODES,
     CIRCLE_ORDER,
     CIRCULAR_CSE_MODES,
     CONFUSION_GAP_MODES,
@@ -91,6 +94,13 @@ CONFUSION_PAIR_METRIC_NAMES = tuple(
         "mutual_confusion_rate",
     )
 )
+BILEVEL_METRIC_NAMES = (
+    "bilevel_outer_classification_loss",
+    "bilevel_hypergradient",
+    "bilevel_gap_before_degrees",
+    "bilevel_gap_after_degrees",
+    "bilevel_updates",
+)
 
 
 def set_random_seed(seed, use_cuda):
@@ -139,6 +149,18 @@ def move_batch_to_device(batch, device):
     ):
         moved[key] = batch[key].to(device)
     return moved
+
+
+def cycle_batches(dataloader):
+    while True:
+        produced = False
+        for batch in dataloader:
+            produced = True
+            yield batch
+        if not produced:
+            raise RuntimeError(
+                "cannot cycle an empty validation dataloader"
+            )
 
 
 def classification_metrics(labels, predictions):
@@ -244,6 +266,216 @@ def _model_forward(model, batch):
     )
 
 
+def _compute_batch_losses(
+    model,
+    batch,
+    class_weights,
+    circular_loss_function,
+    args,
+):
+    outputs = _model_forward(model, batch)
+    losses = compute_sdt_cse_losses(
+        outputs,
+        batch["labels"],
+        batch["utterance_mask"],
+        class_weights,
+        circular_loss_function=circular_loss_function,
+        temperature=args.temperature,
+        fusion_ce_weight=args.fusion_ce_weight,
+        unimodal_ce_weight=args.unimodal_ce_weight,
+        distillation_weight=args.distillation_weight,
+        circular_weight=args.circular_weight,
+        angle_weight=args.angle_weight,
+        confusion_gap_weight=args.confusion_gap_weight,
+        minimum_confusion_gap_degrees=(
+            args.minimum_confusion_gap_degrees
+        ),
+        confusion_classification_weight=(
+            args.confusion_classification_weight
+        ),
+        confusion_classification_margin=(
+            args.confusion_classification_margin
+        ),
+    )
+    return outputs, losses
+
+
+def _bilevel_outer_classification_loss(
+    outputs,
+    batch,
+    class_weights,
+    args,
+):
+    fusion_ce = masked_weighted_cross_entropy(
+        outputs["fusion_logits"],
+        batch["labels"],
+        batch["utterance_mask"],
+        class_weights,
+    )
+    confusion_margin = masked_confusion_classification_margin(
+        outputs["fusion_cosine_scores"],
+        batch["labels"],
+        batch["utterance_mask"],
+        margin=args.confusion_classification_margin,
+    )
+    return (
+        fusion_ce
+        + args.bilevel_outer_confusion_weight * confusion_margin
+    )
+
+
+def bilevel_angle_step(
+    model,
+    training_batch,
+    validation_batch,
+    class_weights,
+    circular_loss_function,
+    args,
+    angle_optimizer,
+):
+    """Approximate a one-step validation hypergradient with DARTS HVP."""
+    if model.experiment_mode not in BILEVEL_ANGLE_MODES:
+        raise ValueError(
+            "bilevel_angle_step requires a bilevel experiment mode"
+        )
+    learner = model.circular_angle_learner
+    if learner is None:
+        raise ValueError("bilevel mode requires an angle learner")
+    angle_parameters = tuple(learner.parameters())
+    if len(angle_parameters) != 1:
+        raise ValueError(
+            "bilevel shared-gap mode requires one angle parameter"
+        )
+    angle_parameter = angle_parameters[0]
+    angle_ids = {id(parameter) for parameter in angle_parameters}
+    weight_parameters = tuple(
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in angle_ids
+    )
+    if not weight_parameters:
+        raise ValueError("model has no non-angle parameters")
+
+    was_training = model.training
+    model.eval()
+    gap_before = float(
+        torch.rad2deg(learner.confusion_gap()).detach().cpu().item()
+    )
+    try:
+        validation_outputs = _model_forward(
+            model, validation_batch
+        )
+        outer_loss = _bilevel_outer_classification_loss(
+            validation_outputs,
+            validation_batch,
+            class_weights,
+            args,
+        )
+        validation_vector = torch.autograd.grad(
+            outer_loss,
+            weight_parameters,
+            allow_unused=True,
+        )
+        vector_norm_squared = outer_loss.new_zeros(())
+        for gradient in validation_vector:
+            if gradient is not None:
+                vector_norm_squared = (
+                    vector_norm_squared
+                    + gradient.detach().pow(2).sum()
+                )
+        vector_norm = torch.sqrt(vector_norm_squared)
+        if (
+            not torch.isfinite(vector_norm)
+            or float(vector_norm.detach().cpu().item()) <= 0.0
+        ):
+            raise RuntimeError(
+                "bilevel validation gradient has zero or nonfinite norm"
+            )
+        epsilon = (
+            float(args.bilevel_hvp_radius)
+            / float(vector_norm.detach().cpu().item())
+        )
+
+        def perturb(scale):
+            with torch.no_grad():
+                for parameter, gradient in zip(
+                    weight_parameters, validation_vector
+                ):
+                    if gradient is not None:
+                        parameter.add_(
+                            gradient.detach(),
+                            alpha=float(scale),
+                        )
+
+        perturbation_state = 0
+        perturb(epsilon)
+        perturbation_state = 1
+        try:
+            _, positive_losses = _compute_batch_losses(
+                model,
+                training_batch,
+                class_weights,
+                circular_loss_function,
+                args,
+            )
+            positive_gradient = torch.autograd.grad(
+                positive_losses["total_loss"],
+                angle_parameter,
+            )[0]
+
+            perturb(-2.0 * epsilon)
+            perturbation_state = -1
+            _, negative_losses = _compute_batch_losses(
+                model,
+                training_batch,
+                class_weights,
+                circular_loss_function,
+                args,
+            )
+            negative_gradient = torch.autograd.grad(
+                negative_losses["total_loss"],
+                angle_parameter,
+            )[0]
+        finally:
+            if perturbation_state == 1:
+                perturb(-epsilon)
+            elif perturbation_state == -1:
+                perturb(epsilon)
+
+        hypergradient = (
+            -float(args.bilevel_inner_step_size)
+            * (positive_gradient - negative_gradient)
+            / (2.0 * epsilon)
+        )
+        if not torch.isfinite(hypergradient).all():
+            raise RuntimeError("bilevel hypergradient is nonfinite")
+        clip = float(args.bilevel_angle_gradient_clip)
+        if clip > 0.0:
+            hypergradient = hypergradient.clamp(
+                min=-clip, max=clip
+            )
+        angle_optimizer.zero_grad()
+        angle_parameter.grad = hypergradient.detach().clone()
+        angle_optimizer.step()
+    finally:
+        model.train(was_training)
+
+    gap_after = float(
+        torch.rad2deg(learner.confusion_gap()).detach().cpu().item()
+    )
+    return {
+        "bilevel_outer_classification_loss": float(
+            outer_loss.detach().cpu().item()
+        ),
+        "bilevel_hypergradient": float(
+            hypergradient.detach().cpu().item()
+        ),
+        "bilevel_gap_before_degrees": gap_before,
+        "bilevel_gap_after_degrees": gap_after,
+        "bilevel_updates": 1.0,
+    }
+
+
 def run_epoch(
     model,
     dataloader,
@@ -253,6 +485,8 @@ def run_epoch(
     args,
     optimizer=None,
     collect_outputs=False,
+    bilevel_angle_optimizer=None,
+    bilevel_validation_batches=None,
 ):
     training = optimizer is not None
     model.train(training)
@@ -269,35 +503,41 @@ def run_epoch(
     text_projected_embeddings = []
     audio_projected_embeddings = []
     visual_projected_embeddings = []
+    bilevel_totals = {
+        name: 0.0 for name in BILEVEL_METRIC_NAMES
+    }
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
         if training:
+            if bilevel_angle_optimizer is not None:
+                if bilevel_validation_batches is None:
+                    raise ValueError(
+                        "bilevel training requires validation batches"
+                    )
+                validation_batch = move_batch_to_device(
+                    next(bilevel_validation_batches),
+                    device,
+                )
+                bilevel_metrics = bilevel_angle_step(
+                    model,
+                    batch,
+                    validation_batch,
+                    class_weights,
+                    circular_loss_function,
+                    args,
+                    bilevel_angle_optimizer,
+                )
+                for name in BILEVEL_METRIC_NAMES:
+                    bilevel_totals[name] += bilevel_metrics[name]
             optimizer.zero_grad()
         with torch.set_grad_enabled(training):
-            outputs = _model_forward(model, batch)
-            losses = compute_sdt_cse_losses(
-                outputs,
-                batch["labels"],
-                batch["utterance_mask"],
+            outputs, losses = _compute_batch_losses(
+                model,
+                batch,
                 class_weights,
-                circular_loss_function=circular_loss_function,
-                temperature=args.temperature,
-                fusion_ce_weight=args.fusion_ce_weight,
-                unimodal_ce_weight=args.unimodal_ce_weight,
-                distillation_weight=args.distillation_weight,
-                circular_weight=args.circular_weight,
-                angle_weight=args.angle_weight,
-                confusion_gap_weight=args.confusion_gap_weight,
-                minimum_confusion_gap_degrees=(
-                    args.minimum_confusion_gap_degrees
-                ),
-                confusion_classification_weight=(
-                    args.confusion_classification_weight
-                ),
-                confusion_classification_margin=(
-                    args.confusion_classification_margin
-                ),
+                circular_loss_function,
+                args,
             )
             if training:
                 losses["total_loss"].backward()
@@ -421,6 +661,17 @@ def run_epoch(
     }
     result.update(classification_metrics(labels, predictions))
     result.update(confusion_pair_metrics(labels, predictions))
+    update_count = bilevel_totals["bilevel_updates"]
+    if update_count > 0:
+        for name in BILEVEL_METRIC_NAMES:
+            result[name] = (
+                bilevel_totals[name]
+                if name == "bilevel_updates"
+                else bilevel_totals[name] / update_count
+            )
+    else:
+        for name in BILEVEL_METRIC_NAMES:
+            result[name] = None
     scale = model.effective_cosine_scale
     result["cosine_scale"] = (
         None if scale is None else float(scale.detach().cpu().item())
@@ -628,6 +879,7 @@ def public_metrics(result):
         "macro_f1",
         "macro_recall",
         *CONFUSION_PAIR_METRIC_NAMES,
+        *BILEVEL_METRIC_NAMES,
         "cosine_scale",
         "text_cosine_scale",
         "audio_cosine_scale",
@@ -713,8 +965,29 @@ def experiment_directory_name(
     confused_cse_pair_weight=1.0,
     confusion_classification_margin=0.1,
     confusion_classification_weight=0.0,
+    bilevel_gap_minimum_degrees=70.0,
+    bilevel_gap_maximum_degrees=110.0,
+    bilevel_gap_initial_degrees=90.0,
+    bilevel_angle_learning_rate=0.001,
+    bilevel_outer_confusion_weight=0.1,
 ):
-    if mode in CONFUSION_MARGIN_MODES:
+    if mode in BILEVEL_ANGLE_MODES:
+        condition = (
+            "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+        ).format(
+            mode,
+            format(float(circular_weight), "g"),
+            format(float(bilevel_gap_minimum_degrees), "g"),
+            format(float(bilevel_gap_maximum_degrees), "g"),
+            format(float(bilevel_gap_initial_degrees), "g"),
+            format(float(confused_cse_pair_weight), "g"),
+            format(float(confusion_classification_margin), "g"),
+            format(float(confusion_classification_weight), "g"),
+            format(float(bilevel_angle_learning_rate), "g"),
+            format(float(bilevel_outer_confusion_weight), "g"),
+        )
+    elif mode in CONFUSION_MARGIN_MODES:
         condition = (
             "{}_{}_lambda_{}_mingap_{}_pair_{}_"
             "clsmargin_{}_clsweight_{}"
@@ -934,6 +1207,46 @@ def confusion_gap_payload(
     }
 
 
+def bilevel_gap_payload(model, args):
+    if model.experiment_mode not in BILEVEL_ANGLE_MODES:
+        return None
+    learner = model.circular_angle_learner
+    gaps = torch.rad2deg(
+        learner.normalized_gaps().detach().cpu()
+    ).tolist()
+    return {
+        "parameterization": (
+            "shared_confusion_gap_with_balanced_remaining_gaps"
+        ),
+        "minimum_degrees": float(
+            args.bilevel_gap_minimum_degrees
+        ),
+        "maximum_degrees": float(
+            args.bilevel_gap_maximum_degrees
+        ),
+        "initial_degrees": float(
+            args.bilevel_gap_initial_degrees
+        ),
+        "selected_confusion_gap_degrees": float(gaps[0]),
+        "selected_remaining_gap_degrees": float(gaps[1]),
+        "normalized_gaps_degrees": [float(value) for value in gaps],
+        "raw_parameter": float(
+            learner.raw_gaps.detach().cpu().item()
+        ),
+        "angle_learning_rate": float(
+            args.bilevel_angle_learning_rate
+        ),
+        "inner_step_size": float(args.bilevel_inner_step_size),
+        "hvp_radius": float(args.bilevel_hvp_radius),
+        "outer_confusion_weight": float(
+            args.bilevel_outer_confusion_weight
+        ),
+        "angle_gradient_clip": float(
+            args.bilevel_angle_gradient_clip
+        ),
+    }
+
+
 def spherical_residual_gate_payload(model):
     return {
         name: float(alpha.detach().cpu().item())
@@ -954,16 +1267,28 @@ def spherical_residual_history_row(epoch, model):
     return row
 
 
-def build_optimizer(model, learning_rate, weight_decay):
+def build_optimizer(
+    model,
+    learning_rate,
+    weight_decay,
+    exclude_angle_parameters=False,
+):
     no_decay_parameters = []
+    excluded_parameter_ids = set()
     if model.circular_angle_learner is not None:
-        no_decay_parameters.extend(
+        angle_parameters = tuple(
             model.circular_angle_learner.parameters()
         )
+        if exclude_angle_parameters:
+            excluded_parameter_ids.update(
+                id(parameter) for parameter in angle_parameters
+            )
+        else:
+            no_decay_parameters.extend(angle_parameters)
     no_decay_parameters.extend(
         model.spherical_residual_parameters()
     )
-    if not no_decay_parameters:
+    if not no_decay_parameters and not excluded_parameter_ids:
         return optim.Adam(
             model.parameters(),
             lr=learning_rate,
@@ -976,7 +1301,10 @@ def build_optimizer(model, learning_rate, weight_decay):
     base_parameters = [
         parameter
         for parameter in model.parameters()
-        if id(parameter) not in no_decay_parameter_ids
+        if (
+            id(parameter) not in no_decay_parameter_ids
+            and id(parameter) not in excluded_parameter_ids
+        )
     ]
     return optim.Adam(
         [
@@ -994,6 +1322,23 @@ def build_optimizer(model, learning_rate, weight_decay):
     )
 
 
+def build_bilevel_angle_optimizer(model, learning_rate):
+    if model.experiment_mode not in BILEVEL_ANGLE_MODES:
+        return None
+    if learning_rate <= 0.0:
+        raise ValueError("bilevel angle learning rate must be positive")
+    parameters = tuple(model.circular_angle_learner.parameters())
+    if len(parameters) != 1:
+        raise ValueError(
+            "bilevel shared-gap mode requires one angle parameter"
+        )
+    return optim.Adam(
+        parameters,
+        lr=learning_rate,
+        weight_decay=0.0,
+    )
+
+
 def save_checkpoint(
     path,
     model,
@@ -1003,6 +1348,8 @@ def save_checkpoint(
     epoch,
     validation_metrics=None,
     selection_metrics=None,
+    angle_optimizer=None,
+    bilevel_metrics=None,
 ):
     angles = build_iemocap_angles(
         geometry=args.circular_geometry,
@@ -1027,6 +1374,11 @@ def save_checkpoint(
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "angle_optimizer_state_dict": (
+            None
+            if angle_optimizer is None
+            else angle_optimizer.state_dict()
+        ),
         "config": vars(args).copy(),
         "emotion_mapping": ID2EMOTION,
         "circular_geometry": args.circular_geometry,
@@ -1043,6 +1395,23 @@ def save_checkpoint(
         ),
         "confusion_classification_weight": (
             args.confusion_classification_weight
+        ),
+        "bilevel_gap_minimum_degrees": (
+            args.bilevel_gap_minimum_degrees
+        ),
+        "bilevel_gap_maximum_degrees": (
+            args.bilevel_gap_maximum_degrees
+        ),
+        "bilevel_gap_initial_degrees": (
+            args.bilevel_gap_initial_degrees
+        ),
+        "bilevel_angle_learning_rate": (
+            args.bilevel_angle_learning_rate
+        ),
+        "bilevel_inner_step_size": args.bilevel_inner_step_size,
+        "bilevel_hvp_radius": args.bilevel_hvp_radius,
+        "bilevel_outer_confusion_weight": (
+            args.bilevel_outer_confusion_weight
         ),
         **gap_payload,
         "circle_order": angle_payload["circle_order"],
@@ -1082,6 +1451,8 @@ def save_checkpoint(
         "spherical_residual_gates": (
             spherical_residual_gate_payload(model)
         ),
+        "bilevel_geometry": bilevel_gap_payload(model, args),
+        "bilevel_metrics": bilevel_metrics,
     }
     torch.save(payload, path)
 
@@ -1144,11 +1515,49 @@ def validate_arguments(args):
         "confusion_gap_weight",
         "confusion_classification_weight",
         "same_class_margin",
+        "bilevel_outer_confusion_weight",
+        "bilevel_angle_gradient_clip",
     ):
         if getattr(args, name) < 0:
             raise ValueError("--{} must be nonnegative".format(
                 name.replace("_", "-")
             ))
+    if args.bilevel_inner_step_size is None:
+        args.bilevel_inner_step_size = args.lr
+    for name in (
+        "bilevel_angle_learning_rate",
+        "bilevel_inner_step_size",
+        "bilevel_hvp_radius",
+    ):
+        value = getattr(args, name)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "--{} must be finite and positive".format(
+                    name.replace("_", "-")
+                )
+            )
+    for name in (
+        "bilevel_outer_confusion_weight",
+        "bilevel_angle_gradient_clip",
+    ):
+        value = getattr(args, name)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "--{} must be finite and nonnegative".format(
+                    name.replace("_", "-")
+                )
+            )
+    if not (
+        0.0
+        < args.bilevel_gap_minimum_degrees
+        < args.bilevel_gap_initial_degrees
+        < args.bilevel_gap_maximum_degrees
+        < 180.0
+    ):
+        raise ValueError(
+            "bilevel gaps must satisfy 0 < minimum < initial "
+            "< maximum < 180"
+        )
     if (
         not np.isfinite(args.minimum_confusion_gap_degrees)
         or args.minimum_confusion_gap_degrees <= 0.0
@@ -1210,6 +1619,20 @@ def validate_arguments(args):
             "confusion-margin mode requires "
             "--minimum-confusion-gap-degrees below 180"
         )
+    if args.experiment_mode in BILEVEL_ANGLE_MODES:
+        if args.selection_protocol != "validation":
+            raise ValueError(
+                "bilevel confusion-gap mode requires "
+                "--selection-protocol validation"
+            )
+        if args.circular_weight <= 0.0:
+            raise ValueError(
+                "bilevel confusion-gap mode requires positive "
+                "--circular-weight"
+            )
+        args.minimum_confusion_gap_degrees = (
+            args.bilevel_gap_minimum_degrees
+        )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
         args.circular_geometry = "equal"
@@ -1264,6 +1687,11 @@ def train_and_test(args):
             args.confused_cse_pair_weight,
             args.confusion_classification_margin,
             args.confusion_classification_weight,
+            args.bilevel_gap_minimum_degrees,
+            args.bilevel_gap_maximum_degrees,
+            args.bilevel_gap_initial_degrees,
+            args.bilevel_angle_learning_rate,
+            args.bilevel_outer_confusion_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1305,6 +1733,15 @@ def train_and_test(args):
         projection_dropout=args.projection_dropout,
         initial_cosine_scale=args.initial_cosine_scale,
         initial_class_angles=prior_class_angles,
+        bilevel_gap_minimum_degrees=(
+            args.bilevel_gap_minimum_degrees
+        ),
+        bilevel_gap_maximum_degrees=(
+            args.bilevel_gap_maximum_degrees
+        ),
+        bilevel_gap_initial_degrees=(
+            args.bilevel_gap_initial_degrees
+        ),
         sdt_residual_update=args.sdt_residual_update,
         spherical_attention_alpha_init=(
             args.spherical_attention_alpha_init
@@ -1342,6 +1779,7 @@ def train_and_test(args):
             ],
             "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
             **initial_angle_payload,
+            "bilevel_geometry": bilevel_gap_payload(model, args),
         },
     )
     circular_loss_function = (
@@ -1357,6 +1795,13 @@ def train_and_test(args):
         model,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        exclude_angle_parameters=(
+            args.experiment_mode in BILEVEL_ANGLE_MODES
+        ),
+    )
+    angle_optimizer = build_bilevel_angle_optimizer(
+        model,
+        learning_rate=args.bilevel_angle_learning_rate,
     )
 
     best_path = os.path.join(run_dir, "best_checkpoint.pt")
@@ -1366,6 +1811,7 @@ def train_and_test(args):
     best_selection = None
     epoch_rows = []
     angle_history_rows = []
+    bilevel_history_rows = []
     residual_gate_history_rows = []
     selection_name = (
         "testing"
@@ -1373,6 +1819,11 @@ def train_and_test(args):
         else "validation"
     )
     selection_loader = loaders[selection_name]
+    bilevel_validation_batches = (
+        cycle_batches(loaders["validation"])
+        if args.experiment_mode in BILEVEL_ANGLE_MODES
+        else None
+    )
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
@@ -1384,6 +1835,8 @@ def train_and_test(args):
             circular_loss_function,
             args,
             optimizer=optimizer,
+            bilevel_angle_optimizer=angle_optimizer,
+            bilevel_validation_batches=bilevel_validation_batches,
         )
         with torch.no_grad():
             selection = run_epoch(
@@ -1420,6 +1873,20 @@ def train_and_test(args):
             write_rows(
                 os.path.join(run_dir, "angle_history.csv"),
                 angle_history_rows,
+            )
+        if args.experiment_mode in BILEVEL_ANGLE_MODES:
+            bilevel_row = {
+                "epoch": epoch,
+                **bilevel_gap_payload(model, args),
+            }
+            for name in BILEVEL_METRIC_NAMES:
+                bilevel_row[name] = training.get(name)
+            bilevel_history_rows.append(bilevel_row)
+            write_rows(
+                os.path.join(
+                    run_dir, "bilevel_gap_history.csv"
+                ),
+                bilevel_history_rows,
             )
         residual_history = spherical_residual_history_row(
             epoch, model
@@ -1469,6 +1936,15 @@ def train_and_test(args):
                     else None
                 ),
                 selection_metrics=best_selection,
+                angle_optimizer=angle_optimizer,
+                bilevel_metrics=(
+                    {
+                        name: training.get(name)
+                        for name in BILEVEL_METRIC_NAMES
+                    }
+                    if args.experiment_mode in BILEVEL_ANGLE_MODES
+                    else None
+                ),
             )
 
     checkpoint = torch.load(best_path, map_location=device)
@@ -1503,6 +1979,9 @@ def train_and_test(args):
                     build_iemocap_vad_anchors().tolist()
                 ),
                 **selected_angle_payload,
+                "bilevel_geometry": bilevel_gap_payload(
+                    model, args
+                ),
             },
         )
     with torch.no_grad():
@@ -1741,6 +2220,10 @@ def train_and_test(args):
         "target_similarity": selected_angle_payload[
             "target_similarity"
         ],
+        "bilevel_geometry": bilevel_gap_payload(model, args),
+        "selected_epoch_bilevel_metrics": checkpoint.get(
+            "bilevel_metrics"
+        ),
         "selected_epoch": best_epoch,
         "training": training_metrics,
         "validation": validation_metrics,
@@ -1866,6 +2349,60 @@ def build_argument_parser():
             "weight for the direct confusion-aware cosine "
             "classification margin (default: %(default)s)"
         ),
+    )
+    parser.add_argument(
+        "--bilevel-gap-minimum-degrees",
+        type=float,
+        default=70.0,
+        help="lower bound for the validation-learned shared gap",
+    )
+    parser.add_argument(
+        "--bilevel-gap-maximum-degrees",
+        type=float,
+        default=110.0,
+        help="upper bound for the validation-learned shared gap",
+    )
+    parser.add_argument(
+        "--bilevel-gap-initial-degrees",
+        type=float,
+        default=90.0,
+        help="initial validation-learned shared gap",
+    )
+    parser.add_argument(
+        "--bilevel-angle-learning-rate",
+        type=float,
+        default=0.001,
+        help="Adam learning rate for the outer gap parameter",
+    )
+    parser.add_argument(
+        "--bilevel-inner-step-size",
+        type=float,
+        default=None,
+        help=(
+            "one-step inner SGD size used by the hypergradient; "
+            "defaults to --lr"
+        ),
+    )
+    parser.add_argument(
+        "--bilevel-hvp-radius",
+        type=float,
+        default=0.01,
+        help="finite-difference radius for the DARTS Hessian-vector product",
+    )
+    parser.add_argument(
+        "--bilevel-outer-confusion-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "confusion-margin weight in the validation outer "
+            "classification objective"
+        ),
+    )
+    parser.add_argument(
+        "--bilevel-angle-gradient-clip",
+        type=float,
+        default=5.0,
+        help="absolute clipping bound for the scalar hypergradient; 0 disables",
     )
     parser.add_argument(
         "--same-class-margin", type=float, default=0.0

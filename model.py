@@ -15,6 +15,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
     "sdt_cse_confusion_margin",
+    "sdt_cse_bilevel_confusion_gap",
 )
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
@@ -24,6 +25,7 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
     "sdt_cse_confusion_margin",
+    "sdt_cse_bilevel_confusion_gap",
 )
 ALL_COSINE_MODES = (
     "sdt_cse_all_cosine",
@@ -34,7 +36,11 @@ FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
 CONFUSION_GAP_MODES = (
     "sdt_cse_learnable_angles_confusion_gap",
 )
-CONFUSION_MARGIN_MODES = ("sdt_cse_confusion_margin",)
+CONFUSION_MARGIN_MODES = (
+    "sdt_cse_confusion_margin",
+    "sdt_cse_bilevel_confusion_gap",
+)
+BILEVEL_ANGLE_MODES = ("sdt_cse_bilevel_confusion_gap",)
 LEARNABLE_ANGLE_MODES = (
     "sdt_cse_learnable_angles",
     *CONFUSION_GAP_MODES,
@@ -128,6 +134,118 @@ class LearnableCircularAngles(nn.Module):
             * math.pi
             * positive_gaps
             / positive_gaps.sum()
+        )
+
+    def forward(self):
+        gaps = self.normalized_gaps()
+        ordered_angles = torch.cat(
+            (
+                gaps.new_zeros(1),
+                torch.cumsum(gaps[:-1], dim=0),
+            )
+        )
+        return ordered_angles[self.inverse_circle_order]
+
+    def angle_offsets(self, angles=None):
+        if angles is None:
+            angles = self()
+        return angles - self.prior_angles
+
+    def regularization(self, angles=None):
+        return self.angle_offsets(angles).pow(2).sum()
+
+    def geometry(self):
+        angles = self()
+        return {
+            "angles": angles,
+            "gaps": self.normalized_gaps(),
+            "offsets": self.angle_offsets(angles),
+            "regularization": self.regularization(angles),
+        }
+
+
+class BilevelConfusionGapAngles(nn.Module):
+    """A validation-learned shared gap with fixed circular order."""
+
+    def __init__(
+        self,
+        minimum_gap_degrees=70.0,
+        maximum_gap_degrees=110.0,
+        initial_gap_degrees=90.0,
+        circle_order=CIRCLE_ORDER,
+    ):
+        super().__init__()
+        minimum = float(minimum_gap_degrees)
+        maximum = float(maximum_gap_degrees)
+        initial = float(initial_gap_degrees)
+        for name, value in (
+            ("minimum_gap_degrees", minimum),
+            ("maximum_gap_degrees", maximum),
+            ("initial_gap_degrees", initial),
+        ):
+            if not math.isfinite(value):
+                raise ValueError("{} must be finite".format(name))
+        if not 0.0 < minimum < initial < maximum < 180.0:
+            raise ValueError(
+                "bilevel gaps must satisfy 0 < minimum < initial "
+                "< maximum < 180"
+            )
+        if 2.0 * maximum >= 360.0:
+            raise ValueError(
+                "maximum gap must leave positive remaining gaps"
+            )
+        if tuple(int(index) for index in circle_order) != CIRCLE_ORDER:
+            raise ValueError(
+                "bilevel confusion gaps require IEMOCAP circle order "
+                "{}".format(CIRCLE_ORDER)
+            )
+
+        fraction = (initial - minimum) / (maximum - minimum)
+        raw_initial = math.log(fraction / (1.0 - fraction))
+        order = torch.tensor(circle_order, dtype=torch.long)
+        self.register_buffer("circle_order", order)
+        self.register_buffer(
+            "inverse_circle_order", torch.argsort(order)
+        )
+        self.register_buffer(
+            "minimum_gap_radians",
+            torch.tensor(math.radians(minimum)),
+        )
+        self.register_buffer(
+            "maximum_gap_radians",
+            torch.tensor(math.radians(maximum)),
+        )
+        self.register_buffer(
+            "initial_gap_radians",
+            torch.tensor(math.radians(initial)),
+        )
+        self.raw_gaps = nn.Parameter(torch.tensor(raw_initial))
+
+        with torch.no_grad():
+            initial_angles = self.forward()
+        self.register_buffer("prior_angles", initial_angles.clone())
+
+    def confusion_gap(self):
+        fraction = torch.sigmoid(self.raw_gaps)
+        return self.minimum_gap_radians + fraction * (
+            self.maximum_gap_radians - self.minimum_gap_radians
+        )
+
+    def normalized_gaps(self):
+        confusion_gap = self.confusion_gap()
+        remaining_gap = (
+            confusion_gap.new_tensor(2.0 * math.pi)
+            - 2.0 * confusion_gap
+        ) / 4.0
+        return torch.stack(
+            (
+                confusion_gap,
+                remaining_gap,
+                confusion_gap,
+                remaining_gap,
+                remaining_gap,
+                remaining_gap,
+            )
         )
 
     def forward(self):
@@ -681,6 +799,9 @@ class SDTCSEModel(nn.Module):
         projection_dropout=0.1,
         initial_cosine_scale=16.0,
         initial_class_angles=None,
+        bilevel_gap_minimum_degrees=70.0,
+        bilevel_gap_maximum_degrees=110.0,
+        bilevel_gap_initial_degrees=90.0,
         sdt_residual_update="standard",
         spherical_attention_alpha_init=0.1,
         spherical_mlp_alpha_init=0.1,
@@ -728,7 +849,14 @@ class SDTCSEModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
         self.circular_angle_learner = None
-        if experiment_mode in LEARNABLE_ANGLE_MODES:
+        if experiment_mode in BILEVEL_ANGLE_MODES:
+            self.circular_angle_learner = BilevelConfusionGapAngles(
+                minimum_gap_degrees=bilevel_gap_minimum_degrees,
+                maximum_gap_degrees=bilevel_gap_maximum_degrees,
+                initial_gap_degrees=bilevel_gap_initial_degrees,
+                circle_order=CIRCLE_ORDER,
+            )
+        elif experiment_mode in LEARNABLE_ANGLE_MODES:
             self.circular_angle_learner = LearnableCircularAngles(
                 num_classes=n_classes,
                 prior_angles=initial_class_angles,

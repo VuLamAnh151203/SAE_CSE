@@ -159,6 +159,33 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_bilevel_confusion_gap",
+                0.1,
+                "confusion_separated",
+                0.0,
+                "validation",
+                "standard",
+                0.1,
+                0.1,
+                70.0,
+                0.0,
+                5.0,
+                0.1,
+                0.1,
+                70.0,
+                110.0,
+                90.0,
+                0.001,
+                0.1,
+            ),
+            (
+                "sdt_cse_bilevel_confusion_gap_lambda_0.1_"
+                "range_70-110_init_90_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_anglelr_0.001_outerconf_0.1"
+            ),
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse",
                 0.1,
                 "equal",
@@ -239,6 +266,35 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(confusion_margin.angle_weight, 0.0)
         self.assertEqual(confusion_margin.confusion_gap_weight, 0.0)
 
+        bilevel = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_confusion_gap",
+            ]
+        )
+        validate_arguments(bilevel)
+        self.assertEqual(
+            bilevel.circular_geometry, "confusion_separated"
+        )
+        self.assertEqual(bilevel.bilevel_gap_minimum_degrees, 70.0)
+        self.assertEqual(bilevel.bilevel_gap_initial_degrees, 90.0)
+        self.assertEqual(bilevel.bilevel_gap_maximum_degrees, 110.0)
+        self.assertEqual(bilevel.bilevel_inner_step_size, bilevel.lr)
+        self.assertEqual(bilevel.angle_weight, 0.0)
+        self.assertEqual(bilevel.confusion_gap_weight, 0.0)
+        self.assertEqual(bilevel.selection_protocol, "validation")
+
+        invalid_bilevel = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_confusion_gap",
+                "--selection-protocol",
+                "test",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_bilevel)
+
         fixed = parser.parse_args(
             ["--experiment-mode", "sdt_cse"]
         )
@@ -305,6 +361,31 @@ class FixedSplitTest(unittest.TestCase):
                 "sdt_cse_confusion_margin_confusion_separated_"
                 "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
                 "clsweight_0.1_test_selected"
+            ),
+        )
+        bilevel = dict(summary)
+        bilevel.update(
+            {
+                "experiment_mode": "sdt_cse_bilevel_confusion_gap",
+                "selection_protocol": "validation",
+                "bilevel_geometry": {
+                    "minimum_degrees": 70.0,
+                    "maximum_degrees": 110.0,
+                    "initial_degrees": 90.0,
+                    "angle_learning_rate": 0.001,
+                    "outer_confusion_weight": 0.1,
+                },
+                "confused_cse_pair_weight": 5.0,
+                "confusion_classification_margin": 0.1,
+                "confusion_classification_weight": 0.1,
+            }
+        )
+        self.assertEqual(
+            condition_name(bilevel),
+            (
+                "sdt_cse_bilevel_confusion_gap_lambda_0.1_"
+                "range_70-110_init_90_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_anglelr_0.001_outerconf_0.1"
             ),
         )
 

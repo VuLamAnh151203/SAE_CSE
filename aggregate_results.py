@@ -46,7 +46,47 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse_confusion_margin":
+    if mode == "sdt_cse_bilevel_confusion_gap":
+        geometry = summary.get("bilevel_geometry") or {}
+        condition = (
+            "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+        ).format(
+            mode,
+            format(float(summary["circular_weight"]), "g"),
+            format(float(geometry.get("minimum_degrees", 70.0)), "g"),
+            format(float(geometry.get("maximum_degrees", 110.0)), "g"),
+            format(float(geometry.get("initial_degrees", 90.0)), "g"),
+            format(
+                float(summary.get("confused_cse_pair_weight", 5.0)),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_margin", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_weight", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(geometry.get("angle_learning_rate", 0.001)),
+                "g",
+            ),
+            format(
+                float(geometry.get("outer_confusion_weight", 0.1)),
+                "g",
+            ),
+        )
+    elif mode == "sdt_cse_confusion_margin":
         condition = (
             "{}_{}_lambda_{}_mingap_{}_pair_{}_"
             "clsmargin_{}_clsweight_{}"
@@ -215,6 +255,11 @@ def aggregate(output_dir):
             "sdt_residual_update": summary.get(
                 "sdt_residual_update", "standard"
             ),
+            "selected_bilevel_gap_degrees": (
+                (summary.get("bilevel_geometry") or {}).get(
+                    "selected_confusion_gap_degrees"
+                )
+            ),
         }
         validation = summary.get("validation") or {}
         for metric in METRICS:
@@ -278,6 +323,7 @@ def aggregate(output_dir):
             "final_mlp_alpha_mean",
             "final_alpha_min",
             "final_alpha_max",
+            "selected_bilevel_gap_degrees",
         ):
             values = np.asarray(
                 [
