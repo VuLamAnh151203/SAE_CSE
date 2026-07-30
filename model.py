@@ -8,6 +8,7 @@ import torch.nn.functional as F
 EXPERIMENT_MODES = (
     "sdt",
     "sdt_cosine",
+    "sdt_hypo",
     "sdt_cse",
     "sdt_cse_all_cosine",
     "sdt_cse_all_modal_cse",
@@ -18,6 +19,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_bilevel_confusion_gap",
     "sdt_cse_bilevel_all_gaps",
 )
+HYPO_MODES = ("sdt_hypo",)
 CIRCULAR_CSE_MODES = (
     "sdt_cse",
     "sdt_cse_all_cosine",

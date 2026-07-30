@@ -8,10 +8,11 @@ The existing `../SDT` implementation and data are not modified.
 
 ## Experiment modes
 
-| Mode | Fusion classifier | Unimodal classifiers | Self-distillation | CircularCSE |
+| Mode | Fusion classifier | Unimodal classifiers | Self-distillation | Auxiliary geometry |
 |---|---|---|---:|---:|
 | `sdt` | Original linear | Original linear | Yes | No |
 | `sdt_cosine` | Spherical projection + cosine | Original linear | Yes | No |
+| `sdt_hypo` | Spherical projection + cosine | Original linear | Yes | Prior-free HYPO prototypes |
 | `sdt_cse` | Spherical projection + cosine | Original linear | Yes | Yes |
 | `sdt_cse_all_cosine` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Yes |
 | `sdt_cse_all_modal_cse` | Spherical projection + cosine | Three spherical projections + cosine | Yes | Fusion + all three modalities |
@@ -42,6 +43,8 @@ The comparisons have distinct purposes:
 
 - `sdt_cosine - sdt` measures the effect of replacing the linear head.
 - `sdt_cse - sdt_cosine` isolates CircularCSE.
+- `sdt_hypo - sdt_cosine` isolates prior-free HYPO prototype
+  supervision without class angles.
 - `sdt_cse - sdt` measures the complete proposed model change.
 - `sdt_cse_all_cosine - sdt_cse` isolates replacing the three original
   unimodal classifiers with cosine classifiers.
@@ -162,6 +165,22 @@ For `sdt_cse` and `sdt_cse_all_cosine`, the complete objective is:
 ```text
 SDT objective + circular_weight * CircularCSE
 ```
+
+For `sdt_hypo`, CircularCSE and all prior-angle terms are disabled. HYPO is
+applied only to valid L2-normalized fusion embeddings:
+
+```text
+SDT objective
++ hypo_loss_weight * (
+    hypo_compactness_weight * compactness + dispersion
+  )
+```
+
+The six prototypes are initialized from training-only class means and then
+updated once per observed class per minibatch with a normalized EMA.
+Validation and test never initialize or update them. Defaults are
+`hypo_loss_weight=0.1`, `hypo_compactness_weight=2`,
+`hypo_temperature=0.1`, and `hypo_prototype_momentum=0.95`.
 
 For `sdt_cse_all_modal_cse`, the objective is:
 
@@ -422,6 +441,21 @@ python train.py \
   --seed 2024
 ```
 
+Run the prior-free HYPO mode with validation-selected checkpointing:
+
+```bash
+python train.py \
+  --experiment-mode sdt_hypo \
+  --selection-protocol validation \
+  --hypo-loss-weight 0.1 \
+  --hypo-compactness-weight 2 \
+  --hypo-temperature 0.1 \
+  --hypo-prototype-momentum 0.95 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
 Run the non-equally spaced NRC-VAD version:
 
 ```bash
@@ -499,6 +533,7 @@ Run the corresponding controls:
 ```bash
 python train.py --experiment-mode sdt --seed 2024
 python train.py --experiment-mode sdt_cosine --seed 2024
+python train.py --experiment-mode sdt_hypo --seed 2024
 python train.py --experiment-mode sdt_cse_all_cosine --seed 2024
 python train.py --experiment-mode sdt_cse_all_modal_cse --seed 2024
 python train.py --experiment-mode sdt_cse_fusion_only --seed 2024
@@ -784,6 +819,17 @@ Learnable-angle runs additionally contain:
 - `learned_circular_geometry.json` from the selected checkpoint;
 - prior angles, learned angles, gaps, offsets, and target similarities in
   the checkpoint and summary.
+
+HYPO runs instead contain:
+
+- `hypo_prototypes.npz` with selected prototype vectors, initialization
+  flags, and per-class update counts;
+- `hypo_geometry.json` with prototype norms, cosine similarities, angular
+  distances, hyperparameters, and selected epoch;
+- prototype-target fusion and projected-embedding geometry diagnostics.
+
+They do not write `circular_geometry.json`; circular geometry, angle, and
+circular target fields are `null` in the checkpoint and summary.
 
 Spherical-residual runs additionally contain:
 

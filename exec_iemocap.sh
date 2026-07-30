@@ -8,6 +8,7 @@ GPU_ID="${GPU_ID:-0}"
 for mode in \
   sdt \
   sdt_cosine \
+  sdt_hypo \
   sdt_cse \
   sdt_cse_all_cosine \
   sdt_cse_all_modal_cse \

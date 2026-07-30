@@ -23,6 +23,9 @@ METRICS = (
     "gap_prior_regularization",
     "confusion_gap_regularization",
     "confusion_classification_margin",
+    "hypo_compactness",
+    "hypo_dispersion",
+    "hypo_total",
     "happy_excited_pair_macro_f1",
     "happy_excited_pair_weighted_f1",
     "happy_excited_mutual_confusion_rate",
@@ -55,7 +58,29 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse_bilevel_all_gaps":
+    if mode == "sdt_hypo":
+        condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
+            mode,
+            format(
+                float(summary.get("hypo_loss_weight", 0.1)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_compactness_weight", 2.0)
+                ),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_temperature", 0.1)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_prototype_momentum", 0.95)
+                ),
+                "g",
+            ),
+        )
+    elif mode == "sdt_cse_bilevel_all_gaps":
         geometry = summary.get("bilevel_geometry") or {}
         condition = (
             "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
@@ -335,6 +360,20 @@ def aggregate(output_dir):
             "sdt_residual_update": summary.get(
                 "sdt_residual_update", "standard"
             ),
+            "hypo_loss_weight": summary.get("hypo_loss_weight"),
+            "hypo_compactness_weight": summary.get(
+                "hypo_compactness_weight"
+            ),
+            "hypo_temperature": summary.get("hypo_temperature"),
+            "hypo_prototype_momentum": summary.get(
+                "hypo_prototype_momentum"
+            ),
+            "hypo_initialized_classes": summary.get(
+                "hypo_initialized_classes"
+            ),
+            "hypo_prototype_coverage": summary.get(
+                "hypo_prototype_coverage"
+            ),
             "selected_bilevel_gap_degrees": (
                 bilevel_geometry.get(
                     "selected_confusion_gap_degrees"
@@ -381,6 +420,18 @@ def aggregate(output_dir):
         item = {
             "condition": condition,
             "runs": len(condition_rows),
+            "hypo_loss_weight": condition_rows[0].get(
+                "hypo_loss_weight"
+            ),
+            "hypo_compactness_weight": condition_rows[0].get(
+                "hypo_compactness_weight"
+            ),
+            "hypo_temperature": condition_rows[0].get(
+                "hypo_temperature"
+            ),
+            "hypo_prototype_momentum": condition_rows[0].get(
+                "hypo_prototype_momentum"
+            ),
         }
         for metric in METRICS:
             values = np.asarray(
@@ -426,6 +477,8 @@ def aggregate(output_dir):
             "selected_bilevel_minimum_gap_degrees",
             "selected_bilevel_maximum_gap_degrees",
             "selected_bilevel_gap_prior_regularization",
+            "hypo_initialized_classes",
+            "hypo_prototype_coverage",
             *(
                 "selected_gap_{}_degrees".format(name)
                 for name in ORDERED_GAP_NAMES

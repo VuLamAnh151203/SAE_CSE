@@ -52,21 +52,49 @@ def observed_similarity_matrix(embeddings, labels, num_classes=6):
     return matrix, counts
 
 
-def compute_geometry_metrics(embeddings, labels, class_angles=None):
+def compute_geometry_metrics(
+    embeddings,
+    labels,
+    class_angles=None,
+    target_similarity=None,
+):
     raw = np.asarray(embeddings, dtype=np.float64)
     normalized = _normalize_rows(raw)
     observed, counts = observed_similarity_matrix(normalized, labels)
-    if class_angles is None:
-        class_angles = build_iemocap_angles()
+    if class_angles is not None and target_similarity is not None:
+        raise ValueError(
+            "provide either class_angles or target_similarity, not both"
+        )
+    if target_similarity is not None:
+        if torch.is_tensor(target_similarity):
+            target_similarity = (
+                target_similarity.detach().cpu().numpy()
+            )
+        target = np.asarray(
+            target_similarity, dtype=np.float64
+        )
+        if target.shape != (6, 6):
+            raise ValueError(
+                "target_similarity must have shape [6, 6]"
+            )
+        if not np.isfinite(target).all():
+            raise ValueError(
+                "target_similarity must contain only finite values"
+            )
+        if not np.allclose(target, target.T, atol=1e-6):
+            raise ValueError("target_similarity must be symmetric")
     else:
-        class_angles = torch.as_tensor(class_angles)
-    target = (
-        build_target_similarity(class_angles)
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.float64)
-    )
+        if class_angles is None:
+            class_angles = build_iemocap_angles()
+        else:
+            class_angles = torch.as_tensor(class_angles)
+        target = (
+            build_target_similarity(class_angles)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
     upper = np.triu_indices(6, k=1)
     valid = np.isfinite(observed[upper])
     observed_pairs = observed[upper][valid]
@@ -171,12 +199,14 @@ def save_geometry_artifacts(
     embeddings,
     labels,
     class_angles=None,
+    target_similarity=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     metrics, observed, target, normalized = compute_geometry_metrics(
         embeddings,
         labels,
         class_angles=class_angles,
+        target_similarity=target_similarity,
     )
     with open(
         os.path.join(output_dir, "{}_metrics.json".format(prefix)),
@@ -205,7 +235,7 @@ def save_geometry_artifacts(
     _save_heatmap(
         os.path.join(output_dir, "{}_target.png".format(prefix)),
         target,
-        "Target circular cosine similarity",
+        "Target cosine similarity",
     )
     _save_heatmap(
         os.path.join(output_dir, "{}_absolute_error.png".format(prefix)),

@@ -456,6 +456,211 @@ class CircularCSELoss(nn.Module):
         ).sum() / valid_weights.sum()
 
 
+class HypoPrototypeLoss(nn.Module):
+    """Prior-free HYPO compactness and dispersion with EMA prototypes."""
+
+    def __init__(
+        self,
+        num_classes,
+        embedding_dim,
+        temperature=0.1,
+        prototype_momentum=0.95,
+    ):
+        super().__init__()
+        if int(num_classes) < 2:
+            raise ValueError("num_classes must be at least 2")
+        if int(embedding_dim) < 1:
+            raise ValueError("embedding_dim must be positive")
+        temperature = float(temperature)
+        prototype_momentum = float(prototype_momentum)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("temperature must be finite and positive")
+        if (
+            not math.isfinite(prototype_momentum)
+            or prototype_momentum < 0.0
+            or prototype_momentum >= 1.0
+        ):
+            raise ValueError(
+                "prototype_momentum must be finite and in [0, 1)"
+            )
+
+        self.num_classes = int(num_classes)
+        self.embedding_dim = int(embedding_dim)
+        self.temperature = temperature
+        self.prototype_momentum = prototype_momentum
+        self.register_buffer(
+            "prototypes",
+            torch.zeros(self.num_classes, self.embedding_dim),
+        )
+        self.register_buffer(
+            "initialized",
+            torch.zeros(self.num_classes, dtype=torch.bool),
+        )
+        self.register_buffer(
+            "update_counts",
+            torch.zeros(self.num_classes, dtype=torch.long),
+        )
+
+    @property
+    def initialized_classes(self):
+        return int(self.initialized.sum().item())
+
+    @property
+    def prototype_coverage(self):
+        return self.initialized_classes / float(self.num_classes)
+
+    def missing_class_ids(self):
+        return (
+            torch.nonzero(~self.initialized, as_tuple=False)
+            .flatten()
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+    def prototype_similarity(self):
+        if not bool(self.initialized.all().item()):
+            return None
+        prototypes = F.normalize(
+            self.prototypes, p=2, dim=-1, eps=1e-8
+        )
+        return torch.matmul(prototypes, prototypes.t())
+
+    def forward(self, embeddings, labels, update_prototypes=False):
+        if embeddings.ndim != 2:
+            raise ValueError("embeddings must have shape [N, D]")
+        if embeddings.size(1) != self.embedding_dim:
+            raise ValueError(
+                "embedding dimension does not match the prototype bank"
+            )
+        if labels.ndim != 1:
+            raise ValueError("labels must have shape [N]")
+        if embeddings.size(0) != labels.size(0):
+            raise ValueError(
+                "embeddings and labels must share their first dimension"
+            )
+        if not torch.isfinite(embeddings).all():
+            raise ValueError("embeddings must contain only finite values")
+        if labels.numel() > 0:
+            if labels.min().item() < 0:
+                raise ValueError("labels must be nonnegative")
+            if labels.max().item() >= self.num_classes:
+                raise ValueError("label exceeds the configured class count")
+
+        embeddings = F.normalize(
+            embeddings, p=2, dim=-1, eps=1e-8
+        )
+        zero = embeddings.sum() * 0.0
+        if embeddings.size(0) == 0:
+            return {
+                "compactness": zero,
+                "dispersion": zero,
+                "active": False,
+            }
+
+        observed = []
+        candidate_prototypes = []
+        for class_id in range(self.num_classes):
+            class_selected = labels.eq(class_id)
+            class_observed = bool(class_selected.any().item())
+            observed.append(class_observed)
+            current = self.prototypes[class_id].detach()
+            if not update_prototypes or not class_observed:
+                candidate = current
+            else:
+                class_mean = F.normalize(
+                    embeddings[class_selected].mean(dim=0),
+                    p=2,
+                    dim=0,
+                    eps=1e-8,
+                )
+                if bool(self.initialized[class_id].item()):
+                    candidate = F.normalize(
+                        self.prototype_momentum * current
+                        + (1.0 - self.prototype_momentum) * class_mean,
+                        p=2,
+                        dim=0,
+                        eps=1e-8,
+                    )
+                else:
+                    candidate = class_mean
+                candidate_norm = torch.linalg.vector_norm(candidate)
+                if (
+                    not bool(torch.isfinite(candidate_norm).item())
+                    or abs(float(candidate_norm.detach().item()) - 1.0)
+                    > 1e-4
+                ):
+                    raise RuntimeError(
+                        "cannot form a unit HYPO prototype for class "
+                        "{} from a degenerate class mean".format(
+                            class_id
+                        )
+                    )
+            candidate_prototypes.append(candidate)
+        candidates = torch.stack(candidate_prototypes, dim=0)
+
+        if update_prototypes:
+            observed_mask = torch.tensor(
+                observed,
+                device=self.initialized.device,
+                dtype=torch.bool,
+            )
+            with torch.no_grad():
+                observed_ids = torch.nonzero(
+                    observed_mask, as_tuple=False
+                ).flatten()
+                self.prototypes.index_copy_(
+                    0,
+                    observed_ids,
+                    candidates.index_select(
+                        0, observed_ids
+                    ).detach(),
+                )
+                self.initialized.logical_or_(observed_mask)
+                self.update_counts.add_(observed_mask.long())
+
+        if not bool(self.initialized.all().item()):
+            return {
+                "compactness": zero,
+                "dispersion": zero,
+                "active": False,
+            }
+
+        committed = F.normalize(
+            self.prototypes.detach(), p=2, dim=-1, eps=1e-8
+        )
+        compactness_logits = torch.matmul(
+            embeddings, committed.t()
+        ) / self.temperature
+        compactness = F.cross_entropy(
+            compactness_logits, labels, reduction="mean"
+        )
+
+        dispersion_prototypes = F.normalize(
+            candidates, p=2, dim=-1, eps=1e-8
+        )
+        similarities = torch.matmul(
+            dispersion_prototypes, dispersion_prototypes.t()
+        ) / self.temperature
+        off_diagonal = ~torch.eye(
+            self.num_classes,
+            dtype=torch.bool,
+            device=similarities.device,
+        )
+        negative_similarities = similarities[off_diagonal].reshape(
+            self.num_classes, self.num_classes - 1
+        )
+        dispersion = (
+            torch.logsumexp(negative_similarities, dim=1)
+            - math.log(self.num_classes - 1)
+        ).mean()
+        return {
+            "compactness": compactness,
+            "dispersion": dispersion,
+            "active": True,
+        }
+
+
 def compute_sdt_cse_losses(
     outputs,
     labels,
@@ -472,20 +677,28 @@ def compute_sdt_cse_losses(
     minimum_confusion_gap_degrees=75.0,
     confusion_classification_weight=0.0,
     confusion_classification_margin=0.1,
+    hypo_loss_function=None,
+    hypo_loss_weight=0.0,
+    hypo_compactness_weight=2.0,
+    update_hypo_prototypes=False,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
         "unimodal_ce_weight": unimodal_ce_weight,
         "distillation_weight": distillation_weight,
         "circular_weight": circular_weight,
+        "hypo_loss_weight": hypo_loss_weight,
+        "hypo_compactness_weight": hypo_compactness_weight,
         "angle_weight": angle_weight,
         "confusion_gap_weight": confusion_gap_weight,
         "confusion_classification_weight": (
             confusion_classification_weight
         ),
     }.items():
-        if value < 0:
-            raise ValueError("{} must be nonnegative".format(name))
+        if not math.isfinite(float(value)) or value < 0:
+            raise ValueError(
+                "{} must be finite and nonnegative".format(name)
+            )
 
     fusion_ce = masked_weighted_cross_entropy(
         outputs["fusion_logits"],
@@ -612,6 +825,33 @@ def compute_sdt_cse_losses(
         text_circular + audio_circular + visual_circular
     )
     total_circular = fusion_circular + unimodal_circular
+    hypo_compactness = circular_zero
+    hypo_dispersion = circular_zero
+    if hypo_loss_function is not None:
+        if outputs["embeddings"] is None:
+            raise ValueError(
+                "HYPO requires projected fusion embeddings"
+            )
+        valid = utterance_mask.reshape(-1) > 0
+        valid_embeddings = outputs["embeddings"].reshape(
+            -1, outputs["embeddings"].size(-1)
+        )[valid]
+        valid_labels = labels.reshape(-1)[valid]
+        hypo_components = hypo_loss_function(
+            valid_embeddings,
+            valid_labels,
+            update_prototypes=update_hypo_prototypes,
+        )
+        hypo_compactness = hypo_components["compactness"]
+        hypo_dispersion = hypo_components["dispersion"]
+    elif hypo_loss_weight > 0:
+        raise ValueError(
+            "positive hypo_loss_weight requires a HYPO prototype loss"
+        )
+    hypo_total = (
+        hypo_compactness_weight * hypo_compactness
+        + hypo_dispersion
+    )
     angle_regularization = outputs["fusion_logits"].sum() * 0.0
     if outputs.get("angle_regularization") is not None:
         angle_regularization = outputs["angle_regularization"]
@@ -666,6 +906,7 @@ def compute_sdt_cse_losses(
         + unimodal_ce_weight * unimodal_ce
         + distillation_weight * distillation
         + circular_weight * total_circular
+        + hypo_loss_weight * hypo_total
         + angle_weight * angle_regularization
         + confusion_gap_weight * confusion_gap_regularization
         + confusion_classification_weight
@@ -689,6 +930,9 @@ def compute_sdt_cse_losses(
         "visual_circular_cse": visual_circular,
         "unimodal_circular_cse": unimodal_circular,
         "total_circular_cse": total_circular,
+        "hypo_compactness": hypo_compactness,
+        "hypo_dispersion": hypo_dispersion,
+        "hypo_total": hypo_total,
         "angle_regularization": angle_regularization,
         "confusion_gap_regularization": (
             confusion_gap_regularization

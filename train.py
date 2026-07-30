@@ -29,6 +29,7 @@ from losses import (
     CIRCULAR_GEOMETRIES,
     CircularCSELoss,
     EMOTION_NAMES,
+    HypoPrototypeLoss,
     ID2EMOTION,
     IEMOCAP_CONFUSION_PAIRS,
     build_iemocap_angles,
@@ -52,6 +53,7 @@ from model import (
     CONFUSION_MARGIN_MODES,
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
+    HYPO_MODES,
     LEARNABLE_ANGLE_MODES,
     SDT_RESIDUAL_UPDATES,
     SDTCSEModel,
@@ -84,6 +86,9 @@ LOSS_NAMES = (
     "gap_prior_regularization",
     "confusion_gap_regularization",
     "confusion_classification_margin",
+    "hypo_compactness",
+    "hypo_dispersion",
+    "hypo_total",
 )
 CONFUSION_PAIR_NAMES = (
     ("happy_excited", 0, 4),
@@ -291,6 +296,8 @@ def _compute_batch_losses(
     class_weights,
     circular_loss_function,
     args,
+    hypo_loss_function=None,
+    update_hypo_prototypes=False,
 ):
     outputs = _model_forward(model, batch)
     losses = compute_sdt_cse_losses(
@@ -315,6 +322,12 @@ def _compute_batch_losses(
         confusion_classification_margin=(
             args.confusion_classification_margin
         ),
+        hypo_loss_function=hypo_loss_function,
+        hypo_loss_weight=args.hypo_loss_weight,
+        hypo_compactness_weight=(
+            args.hypo_compactness_weight
+        ),
+        update_hypo_prototypes=update_hypo_prototypes,
     )
     gap_prior_regularization = outputs["fusion_logits"].sum() * 0.0
     if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
@@ -569,6 +582,7 @@ def run_epoch(
     collect_outputs=False,
     bilevel_angle_optimizer=None,
     bilevel_validation_batches=None,
+    hypo_loss_function=None,
 ):
     training = optimizer is not None
     model.train(training)
@@ -620,6 +634,8 @@ def run_epoch(
                 class_weights,
                 circular_loss_function,
                 args,
+                hypo_loss_function=hypo_loss_function,
+                update_hypo_prototypes=training,
             )
             if training:
                 losses["total_loss"].backward()
@@ -754,6 +770,16 @@ def run_epoch(
     else:
         for name in BILEVEL_METRIC_NAMES:
             result[name] = None
+    result["hypo_initialized_classes"] = (
+        None
+        if hypo_loss_function is None
+        else hypo_loss_function.initialized_classes
+    )
+    result["hypo_prototype_coverage"] = (
+        None
+        if hypo_loss_function is None
+        else hypo_loss_function.prototype_coverage
+    )
     scale = model.effective_cosine_scale
     result["cosine_scale"] = (
         None if scale is None else float(scale.detach().cpu().item())
@@ -813,6 +839,7 @@ def collect_split_with_residual_diagnostics(
     class_weights,
     circular_loss_function,
     args,
+    hypo_loss_function=None,
 ):
     model.enable_spherical_residual_diagnostics(
         enabled=True,
@@ -827,6 +854,7 @@ def collect_split_with_residual_diagnostics(
             circular_loss_function,
             args,
             collect_outputs=True,
+            hypo_loss_function=hypo_loss_function,
         )
         diagnostics = model.spherical_residual_diagnostics()
     finally:
@@ -966,6 +994,8 @@ def public_metrics(result):
         "text_cosine_scale",
         "audio_cosine_scale",
         "visual_cosine_scale",
+        "hypo_initialized_classes",
+        "hypo_prototype_coverage",
     ]
     return {key: result.get(key) for key in keys}
 
@@ -973,6 +1003,77 @@ def public_metrics(result):
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as output:
         json.dump(value, output, indent=2, allow_nan=True)
+
+
+def save_hypo_artifacts(
+    run_dir,
+    hypo_loss_function,
+    args,
+    selected_epoch,
+):
+    if hypo_loss_function is None:
+        return None
+    missing = hypo_loss_function.missing_class_ids()
+    if missing:
+        raise RuntimeError(
+            "cannot export incomplete HYPO prototypes; missing "
+            "class IDs: {}".format(missing)
+        )
+    prototypes = F.normalize(
+        hypo_loss_function.prototypes.detach(),
+        p=2,
+        dim=-1,
+        eps=1e-8,
+    ).cpu().numpy()
+    initialized = (
+        hypo_loss_function.initialized.detach().cpu().numpy()
+    )
+    update_counts = (
+        hypo_loss_function.update_counts.detach().cpu().numpy()
+    )
+    similarities = np.clip(
+        np.matmul(prototypes, prototypes.T), -1.0, 1.0
+    )
+    angular_distances = np.degrees(np.arccos(similarities))
+    np.savez_compressed(
+        os.path.join(run_dir, "hypo_prototypes.npz"),
+        prototypes=prototypes,
+        initialized=initialized,
+        update_counts=update_counts,
+    )
+    payload = {
+        "selected_epoch": int(selected_epoch),
+        "num_classes": int(hypo_loss_function.num_classes),
+        "embedding_dim": int(hypo_loss_function.embedding_dim),
+        "prototype_norms": np.linalg.norm(
+            prototypes, axis=1
+        ).tolist(),
+        "prototype_cosine_similarity": similarities.tolist(),
+        "prototype_angular_distance_degrees": (
+            angular_distances.tolist()
+        ),
+        "initialized": initialized.tolist(),
+        "initialized_classes": (
+            hypo_loss_function.initialized_classes
+        ),
+        "prototype_coverage": (
+            hypo_loss_function.prototype_coverage
+        ),
+        "update_counts": update_counts.tolist(),
+        "hypo_loss_weight": float(args.hypo_loss_weight),
+        "hypo_compactness_weight": float(
+            args.hypo_compactness_weight
+        ),
+        "hypo_temperature": float(args.hypo_temperature),
+        "hypo_prototype_momentum": float(
+            args.hypo_prototype_momentum
+        ),
+    }
+    write_json(
+        os.path.join(run_dir, "hypo_geometry.json"),
+        payload,
+    )
+    return payload
 
 
 def write_rows(path, rows):
@@ -1056,8 +1157,20 @@ def experiment_directory_name(
     bilevel_minimum_class_gap_degrees=20.0,
     bilevel_gap_prior_weight=0.01,
     all_gap_learning_source="validation",
+    hypo_loss_weight=0.1,
+    hypo_compactness_weight=2.0,
+    hypo_temperature=0.1,
+    hypo_prototype_momentum=0.95,
 ):
-    if mode in BILEVEL_ALL_GAP_MODES:
+    if mode in HYPO_MODES:
+        condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
+            mode,
+            format(float(hypo_loss_weight), "g"),
+            format(float(hypo_compactness_weight), "g"),
+            format(float(hypo_temperature), "g"),
+            format(float(hypo_prototype_momentum), "g"),
+        )
+    elif mode in BILEVEL_ALL_GAP_MODES:
         condition = (
             "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
             "clsmargin_{}_clsweight_{}"
@@ -1539,29 +1652,56 @@ def save_checkpoint(
     selection_metrics=None,
     angle_optimizer=None,
     bilevel_metrics=None,
+    hypo_loss_function=None,
 ):
-    angles = build_iemocap_angles(
-        geometry=args.circular_geometry,
-        vad_center=(
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ),
-        minimum_confusion_gap_degrees=(
-            args.minimum_confusion_gap_degrees
-        ),
-    )
-    angle_payload = angle_state_payload(model, angles)
-    gap_payload = confusion_gap_payload(
-        model,
-        angles,
-        args.minimum_confusion_gap_degrees,
-    )
-    selected_angles = torch.tensor(
-        angle_payload["class_angles_radians"],
-        dtype=angles.dtype,
-    )
+    if args.experiment_mode in HYPO_MODES:
+        angle_payload = {
+            "circle_order": None,
+            "prior_angles_radians": None,
+            "class_angles_radians": None,
+            "normalized_gaps_radians": None,
+            "angle_offsets_radians": None,
+            "raw_gaps": None,
+            "angle_regularization": None,
+        }
+        gap_payload = {
+            "minimum_confusion_gap_degrees": None,
+            "confusion_pairs": None,
+            "confusion_pair_gaps_degrees": None,
+            "confusion_gap_regularization": None,
+        }
+        target_similarity = None
+    else:
+        angles = build_iemocap_angles(
+            geometry=args.circular_geometry,
+            vad_center=(
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ),
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
+            ),
+        )
+        angle_payload = angle_state_payload(model, angles)
+        gap_payload = confusion_gap_payload(
+            model,
+            angles,
+            args.minimum_confusion_gap_degrees,
+        )
+        selected_angles = torch.tensor(
+            angle_payload["class_angles_radians"],
+            dtype=angles.dtype,
+        )
+        target_similarity = build_target_similarity(
+            selected_angles
+        ).tolist()
     payload = {
         "model_state_dict": model.state_dict(),
+        "hypo_state_dict": (
+            None
+            if hypo_loss_function is None
+            else hypo_loss_function.state_dict()
+        ),
         "optimizer_state_dict": optimizer.state_dict(),
         "angle_optimizer_state_dict": (
             None
@@ -1571,11 +1711,19 @@ def save_checkpoint(
         "config": vars(args).copy(),
         "emotion_mapping": ID2EMOTION,
         "circular_geometry": args.circular_geometry,
-        "vad_center": [
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ],
-        "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
+        "vad_center": (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else [
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ]
+        ),
+        "nrc_vad_anchors": (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else build_iemocap_vad_anchors().tolist()
+        ),
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
         "confused_cse_pair_weight": args.confused_cse_pair_weight,
@@ -1626,9 +1774,7 @@ def save_checkpoint(
         "angle_regularization": angle_payload[
             "angle_regularization"
         ],
-        "target_similarity": build_target_similarity(
-            selected_angles
-        ).tolist(),
+        "target_similarity": target_similarity,
         "class_weights": iemocap_class_weights().tolist(),
         "split_ids": split_ids,
         "selected_epoch": epoch,
@@ -1654,7 +1800,36 @@ def save_checkpoint(
         ),
         "bilevel_geometry": bilevel_gap_payload(model, args),
         "bilevel_metrics": bilevel_metrics,
+        "hypo_loss_weight": args.hypo_loss_weight,
+        "hypo_compactness_weight": (
+            args.hypo_compactness_weight
+        ),
+        "hypo_temperature": args.hypo_temperature,
+        "hypo_prototype_momentum": (
+            args.hypo_prototype_momentum
+        ),
     }
+    if args.experiment_mode in HYPO_MODES:
+        payload.update(
+            {
+                "circular_geometry": None,
+                "circle_order": None,
+                "prior_class_angles": None,
+                "class_angles": None,
+                "angle_gaps": None,
+                "angle_offsets": None,
+                "raw_gaps": None,
+                "angle_regularization": None,
+                "target_similarity": None,
+                "bilevel_geometry": None,
+                "vad_center": None,
+                "nrc_vad_anchors": None,
+                "minimum_confusion_gap_degrees": None,
+                "confusion_pairs": None,
+                "confusion_pair_gaps_degrees": None,
+                "confusion_gap_regularization": None,
+            }
+        )
     torch.save(payload, path)
 
 
@@ -1727,11 +1902,31 @@ def validate_arguments(args):
         "bilevel_outer_confusion_weight",
         "bilevel_angle_gradient_clip",
         "bilevel_gap_prior_weight",
+        "hypo_loss_weight",
+        "hypo_compactness_weight",
     ):
-        if getattr(args, name) < 0:
-            raise ValueError("--{} must be nonnegative".format(
-                name.replace("_", "-")
-            ))
+        value = getattr(args, name)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(
+                "--{} must be finite and nonnegative".format(
+                    name.replace("_", "-")
+                )
+            )
+    if (
+        not np.isfinite(args.hypo_temperature)
+        or args.hypo_temperature <= 0.0
+    ):
+        raise ValueError(
+            "--hypo-temperature must be finite and positive"
+        )
+    if (
+        not np.isfinite(args.hypo_prototype_momentum)
+        or args.hypo_prototype_momentum < 0.0
+        or args.hypo_prototype_momentum >= 1.0
+    ):
+        raise ValueError(
+            "--hypo-prototype-momentum must be finite and in [0, 1)"
+        )
     if args.bilevel_inner_step_size is None:
         args.bilevel_inner_step_size = args.lr
     for name in (
@@ -1875,16 +2070,26 @@ def validate_arguments(args):
         )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
-        args.circular_geometry = "equal"
-    validated_initial_angles = build_iemocap_angles(
-        geometry=args.circular_geometry,
-        vad_center=(
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ),
-        minimum_confusion_gap_degrees=(
-            args.minimum_confusion_gap_degrees
-        ),
+        args.circular_geometry = (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else "equal"
+        )
+    if args.experiment_mode not in HYPO_MODES:
+        args.hypo_loss_weight = 0.0
+    validated_initial_angles = (
+        None
+        if args.experiment_mode in HYPO_MODES
+        else build_iemocap_angles(
+            geometry=args.circular_geometry,
+            vad_center=(
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ),
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
+            ),
+        )
     )
     if args.experiment_mode in BILEVEL_ALL_GAP_MODES:
         BilevelAllGapsAngles(
@@ -1904,6 +2109,12 @@ def validate_arguments(args):
         args.confusion_gap_weight = 0.0
     if args.experiment_mode not in CONFUSION_MARGIN_MODES:
         args.confused_cse_pair_weight = 1.0
+        args.confusion_classification_weight = 0.0
+    if args.experiment_mode in HYPO_MODES:
+        args.circular_weight = 0.0
+        args.angle_weight = 0.0
+        args.confusion_gap_weight = 0.0
+        args.confused_cse_pair_weight = 0.0
         args.confusion_classification_weight = 0.0
 
 
@@ -1945,6 +2156,10 @@ def train_and_test(args):
             args.bilevel_minimum_class_gap_degrees,
             args.bilevel_gap_prior_weight,
             args.all_gap_learning_source,
+            args.hypo_loss_weight,
+            args.hypo_compactness_weight,
+            args.hypo_temperature,
+            args.hypo_prototype_momentum,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1961,16 +2176,20 @@ def train_and_test(args):
         loaders["split_ids"],
     )
 
-    prior_class_angles = build_iemocap_angles(
-        device=device,
-        geometry=args.circular_geometry,
-        vad_center=(
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ),
-        minimum_confusion_gap_degrees=(
-            args.minimum_confusion_gap_degrees
-        ),
+    prior_class_angles = (
+        None
+        if args.experiment_mode in HYPO_MODES
+        else build_iemocap_angles(
+            device=device,
+            geometry=args.circular_geometry,
+            vad_center=(
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ),
+            minimum_confusion_gap_degrees=(
+                args.minimum_confusion_gap_degrees
+            ),
+        )
     )
     model = SDTCSEModel(
         d_text=args.text_dim,
@@ -2005,39 +2224,44 @@ def train_and_test(args):
         spherical_mlp_alpha_init=args.spherical_mlp_alpha_init,
     ).to(device)
     class_weights = iemocap_class_weights(device=device)
-    initial_angle_payload = angle_state_payload(
-        model, prior_class_angles
-    )
-    initial_gap_payload = confusion_gap_payload(
-        model,
-        prior_class_angles,
-        args.minimum_confusion_gap_degrees,
-    )
-    write_json(
-        os.path.join(run_dir, "circular_geometry.json"),
-        {
-            "geometry": args.circular_geometry,
-            "angle_weight": args.angle_weight,
-            "confusion_gap_weight": args.confusion_gap_weight,
-            "confused_cse_pair_weight": (
-                args.confused_cse_pair_weight
-            ),
-            "confusion_classification_margin": (
-                args.confusion_classification_margin
-            ),
-            "confusion_classification_weight": (
-                args.confusion_classification_weight
-            ),
-            **initial_gap_payload,
-            "vad_center": [
-                args.vad_center_valence,
-                args.vad_center_arousal,
-            ],
-            "nrc_vad_anchors": build_iemocap_vad_anchors().tolist(),
-            **initial_angle_payload,
-            "bilevel_geometry": bilevel_gap_payload(model, args),
-        },
-    )
+    if args.experiment_mode not in HYPO_MODES:
+        initial_angle_payload = angle_state_payload(
+            model, prior_class_angles
+        )
+        initial_gap_payload = confusion_gap_payload(
+            model,
+            prior_class_angles,
+            args.minimum_confusion_gap_degrees,
+        )
+        write_json(
+            os.path.join(run_dir, "circular_geometry.json"),
+            {
+                "geometry": args.circular_geometry,
+                "angle_weight": args.angle_weight,
+                "confusion_gap_weight": args.confusion_gap_weight,
+                "confused_cse_pair_weight": (
+                    args.confused_cse_pair_weight
+                ),
+                "confusion_classification_margin": (
+                    args.confusion_classification_margin
+                ),
+                "confusion_classification_weight": (
+                    args.confusion_classification_weight
+                ),
+                **initial_gap_payload,
+                "vad_center": [
+                    args.vad_center_valence,
+                    args.vad_center_arousal,
+                ],
+                "nrc_vad_anchors": (
+                    build_iemocap_vad_anchors().tolist()
+                ),
+                **initial_angle_payload,
+                "bilevel_geometry": bilevel_gap_payload(
+                    model, args
+                ),
+            },
+        )
     circular_loss_function = (
         CircularCSELoss(
             class_angles=prior_class_angles,
@@ -2045,6 +2269,16 @@ def train_and_test(args):
             confusion_pair_weight=args.confused_cse_pair_weight,
         ).to(device)
         if args.experiment_mode in CIRCULAR_CSE_MODES
+        else None
+    )
+    hypo_loss_function = (
+        HypoPrototypeLoss(
+            num_classes=6,
+            embedding_dim=args.embedding_dim,
+            temperature=args.hypo_temperature,
+            prototype_momentum=args.hypo_prototype_momentum,
+        ).to(device)
+        if args.experiment_mode in HYPO_MODES
         else None
     )
     validation_gap_learning = uses_validation_gap_learning(args)
@@ -2096,7 +2330,19 @@ def train_and_test(args):
             optimizer=optimizer,
             bilevel_angle_optimizer=angle_optimizer,
             bilevel_validation_batches=bilevel_validation_batches,
+            hypo_loss_function=hypo_loss_function,
         )
+        if (
+            epoch == 1
+            and hypo_loss_function is not None
+            and hypo_loss_function.initialized_classes < 6
+        ):
+            raise RuntimeError(
+                "HYPO prototype coverage is incomplete after the "
+                "first training epoch; missing class IDs: {}".format(
+                    hypo_loss_function.missing_class_ids()
+                )
+            )
         with torch.no_grad():
             selection = run_epoch(
                 model,
@@ -2105,6 +2351,7 @@ def train_and_test(args):
                 class_weights,
                 circular_loss_function,
                 args,
+                hypo_loss_function=hypo_loss_function,
             )
         row = {
             "epoch": epoch,
@@ -2117,15 +2364,19 @@ def train_and_test(args):
             os.path.join(run_dir, "epoch_metrics.csv"),
             epoch_rows,
         )
-        current_history = angle_history_row(
-            epoch,
-            model,
-            prior_class_angles,
-            minimum_confusion_gap_degrees=(
-                args.minimum_confusion_gap_degrees
-                if args.experiment_mode in CONFUSION_GAP_MODES
-                else None
-            ),
+        current_history = (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else angle_history_row(
+                epoch,
+                model,
+                prior_class_angles,
+                minimum_confusion_gap_degrees=(
+                    args.minimum_confusion_gap_degrees
+                    if args.experiment_mode in CONFUSION_GAP_MODES
+                    else None
+                ),
+            )
         )
         if current_history is not None:
             angle_history_rows.append(current_history)
@@ -2215,20 +2466,56 @@ def train_and_test(args):
                     if validation_gap_learning
                     else None
                 ),
+                hypo_loss_function=hypo_loss_function,
             )
 
     checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    selected_angle_payload = angle_state_payload(
-        model, prior_class_angles
+    if hypo_loss_function is not None:
+        hypo_state_dict = checkpoint.get("hypo_state_dict")
+        if hypo_state_dict is None:
+            raise RuntimeError(
+                "selected HYPO checkpoint has no prototype state"
+            )
+        hypo_loss_function.load_state_dict(hypo_state_dict)
+    if args.experiment_mode in HYPO_MODES:
+        selected_angle_payload = {
+            "prior_angles_radians": None,
+            "class_angles_radians": None,
+            "normalized_gaps_radians": None,
+            "angle_offsets_radians": None,
+            "angle_regularization": None,
+            "target_similarity": None,
+        }
+        selected_class_angles = None
+        selected_gap_payload = {
+            "minimum_confusion_gap_degrees": None,
+            "confusion_pairs": None,
+            "confusion_pair_gaps_degrees": None,
+            "confusion_gap_regularization": None,
+        }
+    else:
+        selected_angle_payload = angle_state_payload(
+            model, prior_class_angles
+        )
+        selected_class_angles = current_angle_state(
+            model, prior_class_angles
+        )["angles"].detach()
+        selected_gap_payload = confusion_gap_payload(
+            model,
+            prior_class_angles,
+            args.minimum_confusion_gap_degrees,
+        )
+    hypo_geometry = save_hypo_artifacts(
+        run_dir,
+        hypo_loss_function,
+        args,
+        best_epoch,
     )
-    selected_class_angles = current_angle_state(
-        model, prior_class_angles
-    )["angles"].detach()
-    selected_gap_payload = confusion_gap_payload(
-        model,
-        prior_class_angles,
-        args.minimum_confusion_gap_degrees,
+    selected_target_similarity = (
+        None
+        if hypo_loss_function is None
+        else hypo_loss_function.prototype_similarity()
     )
     if model.circular_angle_learner is not None:
         write_json(
@@ -2265,6 +2552,7 @@ def train_and_test(args):
             class_weights,
             circular_loss_function,
             args,
+            hypo_loss_function=hypo_loss_function,
         )
         if loaders["validation"] is not None:
             (
@@ -2277,6 +2565,7 @@ def train_and_test(args):
                 class_weights,
                 circular_loss_function,
                 args,
+                hypo_loss_function=hypo_loss_function,
             )
         else:
             selected_validation = None
@@ -2291,6 +2580,7 @@ def train_and_test(args):
             class_weights,
             circular_loss_function,
             args,
+            hypo_loss_function=hypo_loss_function,
         )
 
     residual_diagnostics = None
@@ -2405,12 +2695,17 @@ def train_and_test(args):
     )
 
     geometry_dir = os.path.join(run_dir, "geometry")
+    geometry_target_arguments = (
+        {"target_similarity": selected_target_similarity}
+        if selected_target_similarity is not None
+        else {"class_angles": selected_class_angles}
+    )
     fusion_geometry = save_geometry_artifacts(
         geometry_dir,
         "fusion_features",
         testing["fusion_features_array"],
         testing["labels_array"],
-        class_angles=selected_class_angles,
+        **geometry_target_arguments
     )
     projected_geometry = None
     if testing["embeddings_array"] is not None:
@@ -2419,7 +2714,7 @@ def train_and_test(args):
             "embeddings",
             testing["embeddings_array"],
             testing["labels_array"],
-            class_angles=selected_class_angles,
+            **geometry_target_arguments
         )
     unimodal_projected_geometry = {}
     for representation_name, result_name in (
@@ -2434,7 +2729,7 @@ def train_and_test(args):
                     representation_name,
                     testing[result_name],
                     testing["labels_array"],
-                    class_angles=selected_class_angles,
+                    **geometry_target_arguments
                 )
             )
     summary = {
@@ -2456,6 +2751,35 @@ def train_and_test(args):
         "selection_split": selection_name,
         "selection_metrics": best_selection,
         "seed": args.seed,
+        "hypo_loss_weight": args.hypo_loss_weight,
+        "hypo_compactness_weight": (
+            args.hypo_compactness_weight
+        ),
+        "hypo_temperature": args.hypo_temperature,
+        "hypo_prototype_momentum": (
+            args.hypo_prototype_momentum
+        ),
+        "hypo_initialized_classes": (
+            None
+            if hypo_loss_function is None
+            else hypo_loss_function.initialized_classes
+        ),
+        "hypo_prototype_coverage": (
+            None
+            if hypo_loss_function is None
+            else hypo_loss_function.prototype_coverage
+        ),
+        "hypo_geometry": hypo_geometry,
+        "hypo_prototypes_path": (
+            "hypo_prototypes.npz"
+            if hypo_loss_function is not None
+            else None
+        ),
+        "hypo_geometry_path": (
+            "hypo_geometry.json"
+            if hypo_loss_function is not None
+            else None
+        ),
         "circular_weight": args.circular_weight,
         "all_gap_learning_source": (
             args.all_gap_learning_source
@@ -2470,11 +2794,19 @@ def train_and_test(args):
             args.confusion_classification_weight
         ),
         **selected_gap_payload,
-        "circular_geometry": args.circular_geometry,
-        "vad_center": [
-            args.vad_center_valence,
-            args.vad_center_arousal,
-        ],
+        "circular_geometry": (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else args.circular_geometry
+        ),
+        "vad_center": (
+            None
+            if args.experiment_mode in HYPO_MODES
+            else [
+                args.vad_center_valence,
+                args.vad_center_arousal,
+            ]
+        ),
         "prior_class_angles": selected_angle_payload[
             "prior_angles_radians"
         ],
@@ -2566,6 +2898,30 @@ def build_argument_parser():
     )
     parser.add_argument(
         "--circular-weight", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--hypo-loss-weight",
+        type=float,
+        default=0.1,
+        help="outer HYPO auxiliary-loss weight",
+    )
+    parser.add_argument(
+        "--hypo-compactness-weight",
+        type=float,
+        default=2.0,
+        help="compactness weight inside the HYPO objective",
+    )
+    parser.add_argument(
+        "--hypo-temperature",
+        type=float,
+        default=0.1,
+        help="temperature for HYPO compactness and dispersion",
+    )
+    parser.add_argument(
+        "--hypo-prototype-momentum",
+        type=float,
+        default=0.95,
+        help="EMA momentum for the training-only HYPO prototypes",
     )
     parser.add_argument(
         "--angle-weight",
