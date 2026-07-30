@@ -335,11 +335,34 @@ confusion_classification_weight * mean(
 )
 ```
 
-Only gold happy, excited, angry, and frustrated utterances enter this term.
-It directly updates the projected fusion embedding and cosine classifier
-weights. Defaults are pair weight `5`, cosine margin `0.1`, and
+By default, only gold happy, excited, angry, and frustrated utterances enter
+this term. It directly updates the projected fusion embedding and cosine
+classifier weights. Defaults are pair weight `5`, cosine margin `0.1`, and
 classification-margin weight `0.1`. Original unimodal CE and
 self-distillation remain active.
+
+Extra consecutive circular pairs can be added without creating another
+mode:
+
+```bash
+--additional-confusion-pairs sad-neutral
+```
+
+The original happy-excited and angry-frustrated pairs remain active. Every
+configured pair receives the fixed requested gap, weighted CircularCSE, and
+the direct bidirectional classification margin. Unselected consecutive gaps
+share the remaining circumference equally. For example, adding sad-neutral
+at 75 degrees produces:
+
+```text
+[75, 45, 75, 45, 75, 45] degrees
+```
+
+Multiple additional pairs may be supplied as space-separated values. They
+must be consecutive in the fixed circular order and the requested gaps must
+leave positive circumference for every unselected gap. The selected list is
+included in result-directory names, checkpoints, geometry JSON, summaries,
+and aggregate CSV files. Validation remains checkpoint-only.
 
 For `sdt_cse_bilevel_confusion_gap`, one shared scalar controls both
 happy-excited and angry-frustrated gaps:
@@ -693,6 +716,7 @@ python train.py \
   --confused-cse-pair-weight 5 \
   --confusion-classification-margin 0.1 \
   --confusion-classification-weight 0.1 \
+  --additional-confusion-pairs sad-neutral \
   --device cuda \
   --gpu-id 0 \
   --seed 2024

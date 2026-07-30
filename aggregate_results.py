@@ -36,6 +36,15 @@ METRICS = (
     "sad_neutral_pair_macro_f1",
     "sad_neutral_pair_weighted_f1",
     "sad_neutral_mutual_confusion_rate",
+    "excited_angry_pair_macro_f1",
+    "excited_angry_pair_weighted_f1",
+    "excited_angry_mutual_confusion_rate",
+    "frustrated_sad_pair_macro_f1",
+    "frustrated_sad_pair_weighted_f1",
+    "frustrated_sad_mutual_confusion_rate",
+    "neutral_happy_pair_macro_f1",
+    "neutral_happy_pair_weighted_f1",
+    "neutral_happy_mutual_confusion_rate",
 )
 ORDERED_GAP_NAMES = (
     "happy_to_excited",
@@ -49,6 +58,9 @@ CONFUSION_GAP_NAMES = (
     "happy_excited",
     "angry_frustrated",
     "sad_neutral",
+    "excited_angry",
+    "frustrated_sad",
+    "neutral_happy",
 )
 
 
@@ -453,6 +465,13 @@ def condition_name(summary):
                 "g",
             ),
         )
+        additional_pairs = summary.get(
+            "additional_confusion_pairs"
+        ) or []
+        if additional_pairs:
+            condition += "_add_{}".format(
+                "_".join(additional_pairs)
+            )
     elif (
         mode
         == "sdt_cse_learnable_angles_confusion_gap_hypo_aligned"
@@ -643,6 +662,9 @@ def aggregate(output_dir):
             "angle_holdout_ratio": summary.get(
                 "angle_holdout_ratio"
             ),
+            "additional_confusion_pairs": ",".join(
+                summary.get("additional_confusion_pairs") or []
+            ),
             "sdt_residual_update": summary.get(
                 "sdt_residual_update", "standard"
             ),
@@ -736,6 +758,9 @@ def aggregate(output_dir):
             ),
             "angle_holdout_ratio": condition_rows[0].get(
                 "angle_holdout_ratio"
+            ),
+            "additional_confusion_pairs": condition_rows[0].get(
+                "additional_confusion_pairs"
             ),
             "hypo_loss_weight": condition_rows[0].get(
                 "hypo_loss_weight"

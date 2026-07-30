@@ -59,6 +59,7 @@ def build_iemocap_angles(
     geometry="equal",
     vad_center=(0.5, 0.5),
     minimum_confusion_gap_degrees=75.0,
+    confusion_pairs=IEMOCAP_CONFUSION_PAIRS,
 ):
     if geometry not in CIRCULAR_GEOMETRIES:
         raise ValueError(
@@ -88,29 +89,80 @@ def build_iemocap_angles(
                 "minimum_confusion_gap_degrees must be finite and "
                 "in (0, 180) for confusion-separated geometry"
             )
-        remaining_gap = (360.0 - 2.0 * minimum_gap) / 4.0
-        if remaining_gap <= 0.0:
-            raise ValueError(
-                "confusion-separated geometry requires positive "
-                "non-confusion gaps"
-            )
-        # Circular order: happy, excited, angry, frustrated, sad,
-        # neutral. The two predefined confusion gaps are fixed to the
-        # requested value and the remaining circumference is balanced.
+        circle_order_ids = (0, 4, 3, 5, 1, 2)
+        edge_positions = {
+            frozenset(
+                (
+                    circle_order_ids[position],
+                    circle_order_ids[
+                        (position + 1) % len(circle_order_ids)
+                    ],
+                )
+            ): position
+            for position in range(len(circle_order_ids))
+        }
+        if not confusion_pairs:
+            raise ValueError("confusion_pairs must not be empty")
+        selected_positions = set()
+        selected_pairs = set()
+        for first_id, second_id in confusion_pairs:
+            first_id = int(first_id)
+            second_id = int(second_id)
+            pair = frozenset((first_id, second_id))
+            if len(pair) != 2:
+                raise ValueError(
+                    "confusion pairs must contain different classes"
+                )
+            if pair in selected_pairs:
+                raise ValueError(
+                    "confusion pairs must not contain duplicates"
+                )
+            if pair not in edge_positions:
+                raise ValueError(
+                    "confusion-separated geometry supports only "
+                    "consecutive pairs in circular order"
+                )
+            selected_pairs.add(pair)
+            selected_positions.add(edge_positions[pair])
+
+        selected_count = len(selected_positions)
+        if selected_count == len(circle_order_ids):
+            if not math.isclose(
+                minimum_gap * selected_count,
+                360.0,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    "selecting all circular pairs requires a "
+                    "60-degree gap"
+                )
+            remaining_gap = minimum_gap
+        else:
+            remaining_gap = (
+                360.0 - selected_count * minimum_gap
+            ) / (len(circle_order_ids) - selected_count)
+            if remaining_gap <= 0.0:
+                raise ValueError(
+                    "confusion-separated geometry requires positive "
+                    "non-confusion gaps"
+                )
+        ordered_gaps = [
+            minimum_gap
+            if position in selected_positions
+            else remaining_gap
+            for position in range(len(circle_order_ids))
+        ]
+        ordered_degrees = [0.0]
+        for gap in ordered_gaps[:-1]:
+            ordered_degrees.append(ordered_degrees[-1] + gap)
         ordered_degrees = torch.tensor(
-            [
-                0.0,
-                minimum_gap,
-                minimum_gap + remaining_gap,
-                2.0 * minimum_gap + remaining_gap,
-                2.0 * minimum_gap + 2.0 * remaining_gap,
-                2.0 * minimum_gap + 3.0 * remaining_gap,
-            ],
+            ordered_degrees,
             device=device,
             dtype=dtype,
         )
         circle_order = torch.tensor(
-            [0, 4, 3, 5, 1, 2],
+            circle_order_ids,
             device=device,
             dtype=torch.long,
         )
@@ -283,7 +335,8 @@ def masked_confusion_classification_margin(
     )
     if not pairs:
         raise ValueError("pairs must not be empty")
-    competitor_by_class = {}
+    normalized_pairs = []
+    seen_pairs = set()
     for first_id, second_id in pairs:
         first_id = int(first_id)
         second_id = int(second_id)
@@ -291,47 +344,46 @@ def masked_confusion_classification_margin(
             raise ValueError(
                 "confusion pairs must contain different classes"
             )
-        if (
-            first_id in competitor_by_class
-            or second_id in competitor_by_class
-        ):
+        pair = frozenset((first_id, second_id))
+        if pair in seen_pairs:
             raise ValueError(
-                "each class may occur in at most one confusion pair"
+                "confusion pairs must not contain duplicates"
             )
-        competitor_by_class[first_id] = second_id
-        competitor_by_class[second_id] = first_id
-    if competitor_by_class:
-        minimum_id = min(competitor_by_class)
-        maximum_id = max(competitor_by_class)
+        seen_pairs.add(pair)
+        normalized_pairs.append((first_id, second_id))
+    if normalized_pairs:
+        class_ids = [
+            class_id
+            for pair in normalized_pairs
+            for class_id in pair
+        ]
+        minimum_id = min(class_ids)
+        maximum_id = max(class_ids)
         if minimum_id < 0 or maximum_id >= cosine_scores.size(-1):
             raise ValueError(
                 "confusion pair class ID exceeds cosine scores"
             )
 
-    selected = torch.zeros_like(valid_labels, dtype=torch.bool)
-    competitors = torch.zeros_like(valid_labels)
-    for class_id, competitor_id in competitor_by_class.items():
-        class_selected = valid_labels.eq(class_id)
-        selected = selected | class_selected
-        competitors[class_selected] = competitor_id
-    if selected.sum().item() == 0:
+    pair_losses = []
+    for first_id, second_id in normalized_pairs:
+        for class_id, competitor_id in (
+            (first_id, second_id),
+            (second_id, first_id),
+        ):
+            selected = valid_labels.eq(class_id)
+            if selected.any():
+                selected_scores = valid_scores[selected]
+                true_scores = selected_scores[:, class_id]
+                competing_scores = selected_scores[:, competitor_id]
+                pair_losses.append(
+                    F.relu(
+                        true_scores.new_tensor(margin)
+                        - (true_scores - competing_scores)
+                    )
+                )
+    if not pair_losses:
         return cosine_scores.sum() * 0.0
-
-    selected_scores = valid_scores[selected]
-    selected_labels = valid_labels[selected]
-    selected_competitors = competitors[selected]
-    row_ids = torch.arange(
-        selected_scores.size(0),
-        device=selected_scores.device,
-    )
-    true_scores = selected_scores[row_ids, selected_labels]
-    competing_scores = selected_scores[
-        row_ids, selected_competitors
-    ]
-    return F.relu(
-        true_scores.new_tensor(margin)
-        - (true_scores - competing_scores)
-    ).mean()
+    return torch.cat(pair_losses).mean()
 
 
 class CircularCSELoss(nn.Module):
@@ -975,6 +1027,7 @@ def compute_sdt_cse_losses(
                 labels,
                 utterance_mask,
                 margin=confusion_classification_margin,
+                pairs=confusion_gap_pairs,
             )
         )
     elif confusion_classification_weight > 0:

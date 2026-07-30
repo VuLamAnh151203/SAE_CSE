@@ -261,6 +261,40 @@ class FixedSplitTest(unittest.TestCase):
                 "clsweight_0.1"
             ),
         )
+        extra_pair_condition = experiment_directory_name(
+            "sdt_cse_confusion_margin",
+            0.1,
+            "confusion_separated",
+            minimum_confusion_gap_degrees=75.0,
+            confused_cse_pair_weight=5.0,
+            confusion_classification_margin=0.1,
+            confusion_classification_weight=0.1,
+            additional_confusion_pairs=("sad-neutral",),
+        )
+        self.assertEqual(
+            extra_pair_condition,
+            (
+                "sdt_cse_confusion_margin_confusion_separated_"
+                "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_add_sad-neutral"
+            ),
+        )
+        self.assertEqual(
+            condition_name(
+                {
+                    "experiment_mode": "sdt_cse_confusion_margin",
+                    "circular_geometry": "confusion_separated",
+                    "circular_weight": 0.1,
+                    "selection_protocol": "validation",
+                    "minimum_confusion_gap_degrees": 75.0,
+                    "confused_cse_pair_weight": 5.0,
+                    "confusion_classification_margin": 0.1,
+                    "confusion_classification_weight": 0.1,
+                    "additional_confusion_pairs": ["sad-neutral"],
+                }
+            ),
+            extra_pair_condition,
+        )
         self.assertEqual(
             experiment_directory_name(
                 "sdt_cse_bilevel_confusion_gap",
@@ -500,6 +534,56 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(confusion_margin.angle_weight, 0.0)
         self.assertEqual(confusion_margin.confusion_gap_weight, 0.0)
+
+        extra_pair_margin = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_confusion_margin",
+                "--additional-confusion-pairs",
+                "sad-neutral",
+            ]
+        )
+        validate_arguments(extra_pair_margin)
+        self.assertEqual(
+            extra_pair_margin.additional_confusion_pairs,
+            ("sad-neutral",),
+        )
+
+        invalid_extra_pair_mode = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse",
+                "--additional-confusion-pairs",
+                "sad-neutral",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_extra_pair_mode)
+
+        invalid_redundant_pair = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_confusion_margin",
+                "--additional-confusion-pairs",
+                "happy-excited",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_redundant_pair)
+
+        invalid_extra_pair_geometry = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_confusion_margin",
+                "--additional-confusion-pairs",
+                "excited-angry",
+                "frustrated-sad",
+                "sad-neutral",
+                "neutral-happy",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_extra_pair_geometry)
 
         bilevel = parser.parse_args(
             [
@@ -775,6 +859,18 @@ class FixedSplitTest(unittest.TestCase):
                 "sdt_cse_confusion_margin_confusion_separated_"
                 "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
                 "clsweight_0.1_test_selected"
+            ),
+        )
+        extra_pair_margin = dict(confusion_margin)
+        extra_pair_margin["additional_confusion_pairs"] = [
+            "sad-neutral"
+        ]
+        self.assertEqual(
+            condition_name(extra_pair_margin),
+            (
+                "sdt_cse_confusion_margin_confusion_separated_"
+                "lambda_0.1_mingap_75_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_add_sad-neutral_test_selected"
             ),
         )
         bilevel = dict(summary)

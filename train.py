@@ -101,7 +101,18 @@ CONFUSION_PAIR_NAMES = (
     ("happy_excited", 0, 4),
     ("angry_frustrated", 3, 5),
     ("sad_neutral", 1, 2),
+    ("excited_angry", 4, 3),
+    ("frustrated_sad", 5, 1),
+    ("neutral_happy", 2, 0),
 )
+ADDITIONAL_CONFUSION_PAIR_IDS = {
+    "happy-excited": (0, 4),
+    "excited-angry": (4, 3),
+    "angry-frustrated": (3, 5),
+    "frustrated-sad": (5, 1),
+    "sad-neutral": (1, 2),
+    "neutral-happy": (2, 0),
+}
 CONFUSION_PAIR_METRIC_NAMES = tuple(
     "{}_{}".format(pair_name, suffix)
     for pair_name, _, _ in CONFUSION_PAIR_NAMES
@@ -219,6 +230,22 @@ def confusion_gap_pairs_for_mode(experiment_mode):
     if experiment_mode in THREE_PAIR_CONFUSION_GAP_MODES:
         return IEMOCAP_THREE_CONFUSION_GAP_PAIRS
     return IEMOCAP_CONFUSION_PAIRS
+
+
+def configured_confusion_pairs(args):
+    pairs = list(
+        confusion_gap_pairs_for_mode(args.experiment_mode)
+    )
+    seen = {frozenset(pair) for pair in pairs}
+    for pair_name in getattr(
+        args, "additional_confusion_pairs", ()
+    ):
+        pair = ADDITIONAL_CONFUSION_PAIR_IDS[pair_name]
+        normalized = frozenset(pair)
+        if normalized not in seen:
+            pairs.append(pair)
+            seen.add(normalized)
+    return tuple(pairs)
 
 
 def set_random_seed(seed, use_cuda):
@@ -416,9 +443,7 @@ def _compute_batch_losses(
         minimum_confusion_gap_degrees=(
             args.minimum_confusion_gap_degrees
         ),
-        confusion_gap_pairs=confusion_gap_pairs_for_mode(
-            model.experiment_mode
-        ),
+        confusion_gap_pairs=configured_confusion_pairs(args),
         confusion_classification_weight=(
             args.confusion_classification_weight
         ),
@@ -1358,6 +1383,7 @@ def experiment_directory_name(
     hypo_warmup_epochs=0,
     hypo_ramp_epochs=0,
     angle_holdout_ratio=0.10,
+    additional_confusion_pairs=(),
 ):
     if mode in PRIOR_FREE_HYPO_MODES:
         condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
@@ -1504,6 +1530,13 @@ def experiment_directory_name(
             format(float(confusion_classification_margin), "g"),
             format(float(confusion_classification_weight), "g"),
         )
+        if (
+            mode == "sdt_cse_confusion_margin"
+            and additional_confusion_pairs
+        ):
+            condition += "_add_{}".format(
+                "_".join(additional_confusion_pairs)
+            )
     elif mode in CONFUSION_GAP_MODES:
         condition = (
             "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
@@ -1668,10 +1701,14 @@ def confusion_gap_payload(
     model,
     fixed_class_angles,
     minimum_gap_degrees,
+    pairs=None,
 ):
     state = current_angle_state(model, fixed_class_angles)
     angles = state["angles"]
-    pairs = confusion_gap_pairs_for_mode(model.experiment_mode)
+    if pairs is None:
+        pairs = confusion_gap_pairs_for_mode(
+            model.experiment_mode
+        )
     distances = circular_pair_distances(
         angles,
         pairs,
@@ -1981,12 +2018,14 @@ def save_checkpoint(
             minimum_confusion_gap_degrees=(
                 args.minimum_confusion_gap_degrees
             ),
+            confusion_pairs=configured_confusion_pairs(args),
         )
         angle_payload = angle_state_payload(model, angles)
         gap_payload = confusion_gap_payload(
             model,
             angles,
             args.minimum_confusion_gap_degrees,
+            pairs=configured_confusion_pairs(args),
         )
         selected_angles = torch.tensor(
             angle_payload["class_angles_radians"],
@@ -2027,6 +2066,9 @@ def save_checkpoint(
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
         "confused_cse_pair_weight": args.confused_cse_pair_weight,
+        "additional_confusion_pairs": list(
+            args.additional_confusion_pairs
+        ),
         "confusion_classification_margin": (
             args.confusion_classification_margin
         ),
@@ -2168,6 +2210,33 @@ def final_classification_details(labels, predictions):
 
 def validate_arguments(args):
     apply_hypo_mode_defaults(args)
+    args.additional_confusion_pairs = tuple(
+        getattr(args, "additional_confusion_pairs", ()) or ()
+    )
+    if len(set(args.additional_confusion_pairs)) != len(
+        args.additional_confusion_pairs
+    ):
+        raise ValueError(
+            "--additional-confusion-pairs must not contain duplicates"
+        )
+    redundant_pairs = {
+        "happy-excited",
+        "angry-frustrated",
+    }.intersection(args.additional_confusion_pairs)
+    if redundant_pairs:
+        raise ValueError(
+            "{} are already default confusion pairs".format(
+                ", ".join(sorted(redundant_pairs))
+            )
+        )
+    if (
+        args.additional_confusion_pairs
+        and args.experiment_mode != "sdt_cse_confusion_margin"
+    ):
+        raise ValueError(
+            "--additional-confusion-pairs applies only to "
+            "sdt_cse_confusion_margin"
+        )
     if args.angle_holdout_ratio is None:
         args.angle_holdout_ratio = (
             0.10
@@ -2486,6 +2555,7 @@ def validate_arguments(args):
             minimum_confusion_gap_degrees=(
                 args.minimum_confusion_gap_degrees
             ),
+            confusion_pairs=configured_confusion_pairs(args),
         )
     )
     if args.experiment_mode in BILEVEL_ALL_GAP_MODES:
@@ -2562,6 +2632,7 @@ def train_and_test(args):
             args.hypo_warmup_epochs,
             args.hypo_ramp_epochs,
             args.angle_holdout_ratio,
+            args.additional_confusion_pairs,
         ),
         "seed_{}".format(args.seed),
     )
@@ -2591,6 +2662,7 @@ def train_and_test(args):
             minimum_confusion_gap_degrees=(
                 args.minimum_confusion_gap_degrees
             ),
+            confusion_pairs=configured_confusion_pairs(args),
         )
     )
     model = SDTCSEModel(
@@ -2634,6 +2706,7 @@ def train_and_test(args):
             model,
             prior_class_angles,
             args.minimum_confusion_gap_degrees,
+            pairs=configured_confusion_pairs(args),
         )
         write_json(
             os.path.join(run_dir, "circular_geometry.json"),
@@ -2643,6 +2716,9 @@ def train_and_test(args):
                 "confusion_gap_weight": args.confusion_gap_weight,
                 "confused_cse_pair_weight": (
                     args.confused_cse_pair_weight
+                ),
+                "additional_confusion_pairs": list(
+                    args.additional_confusion_pairs
                 ),
                 "confusion_classification_margin": (
                     args.confusion_classification_margin
@@ -2669,6 +2745,7 @@ def train_and_test(args):
             class_angles=prior_class_angles,
             same_class_margin=args.same_class_margin,
             confusion_pair_weight=args.confused_cse_pair_weight,
+            confusion_pairs=configured_confusion_pairs(args),
         ).to(device)
         if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
@@ -2936,6 +3013,7 @@ def train_and_test(args):
             model,
             prior_class_angles,
             args.minimum_confusion_gap_degrees,
+            pairs=configured_confusion_pairs(args),
         )
     hypo_alignment_target = (
         build_target_similarity(selected_class_angles)
@@ -3279,6 +3357,9 @@ def train_and_test(args):
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
         "confused_cse_pair_weight": args.confused_cse_pair_weight,
+        "additional_confusion_pairs": list(
+            args.additional_confusion_pairs
+        ),
         "confusion_classification_margin": (
             args.confusion_classification_margin
         ),
@@ -3496,6 +3577,17 @@ def build_argument_parser():
         ),
     )
     parser.add_argument(
+        "--additional-confusion-pairs",
+        nargs="*",
+        choices=tuple(ADDITIONAL_CONFUSION_PAIR_IDS),
+        default=(),
+        help=(
+            "additional consecutive circular pairs used by "
+            "sdt_cse_confusion_margin; for example "
+            "--additional-confusion-pairs sad-neutral"
+        ),
+    )
+    parser.add_argument(
         "--confusion-classification-margin",
         type=float,
         default=0.1,
@@ -3620,8 +3712,8 @@ def build_argument_parser():
             "equal uses the original six equally spaced angles; "
             "nrc_vad derives nonuniform angles from NRC-VAD anchors; "
             "confusion_separated fixes happy-excited and "
-            "angry-frustrated at the requested minimum gap and "
-            "balances the other four gaps. "
+            "angry-frustrated plus configured additional pairs at "
+            "the requested minimum gap and balances the other gaps. "
             "Defaults to nrc_vad for sdt_cse_learnable_angles and "
             "confusion_separated for confusion-margin mode"
         ),

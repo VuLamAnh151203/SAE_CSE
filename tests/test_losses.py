@@ -52,6 +52,37 @@ class CircularCSELossTest(unittest.TestCase):
             )
         )
 
+    def test_confusion_separated_geometry_accepts_extra_pairs(self):
+        pairs = ((0, 4), (3, 5), (1, 2))
+        angles = build_iemocap_angles(
+            geometry="confusion_separated",
+            minimum_confusion_gap_degrees=75.0,
+            confusion_pairs=pairs,
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.rad2deg(angles),
+                torch.tensor(
+                    [0.0, 240.0, 315.0, 120.0, 75.0, 195.0]
+                ),
+                atol=1e-5,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.rad2deg(
+                    circular_pair_distances(angles, pairs=pairs)
+                ),
+                torch.tensor([75.0, 75.0, 75.0]),
+                atol=1e-5,
+            )
+        )
+        with self.assertRaises(ValueError):
+            build_iemocap_angles(
+                geometry="confusion_separated",
+                confusion_pairs=((0, 3),),
+            )
+
     def test_weighted_circular_cse_uses_weighted_ordered_mean(self):
         angles = build_iemocap_angles(
             geometry="confusion_separated"
@@ -278,6 +309,23 @@ class SelfDistillationLossTest(unittest.TestCase):
         self.assertGreater(float(scores.grad[0, :4].abs().sum()), 0.0)
         self.assertEqual(float(scores.grad[0, 4].abs().sum()), 0.0)
         self.assertEqual(float(scores.grad[0, 5].abs().sum()), 0.0)
+
+    def test_confusion_margin_supports_overlapping_pairs(self):
+        scores = torch.zeros(1, 1, 6, requires_grad=True)
+        with torch.no_grad():
+            scores[0, 0, 4] = 0.30
+            scores[0, 0, 0] = 0.25
+            scores[0, 0, 3] = 0.50
+        loss = masked_confusion_classification_margin(
+            scores,
+            torch.tensor([[4]]),
+            torch.tensor([[1.0]]),
+            margin=0.1,
+            pairs=((0, 4), (4, 3)),
+        )
+        self.assertAlmostEqual(float(loss), 0.175, places=6)
+        loss.backward()
+        self.assertGreater(float(scores.grad.abs().sum()), 0.0)
 
     def _outputs(self):
         return {
