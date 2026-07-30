@@ -21,6 +21,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 | `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
+| `sdt_cse_bilevel_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Bilevel circular gap + circle-aligned HYPO prototypes |
 | `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | Six hard-floor ordered gaps learned from validation or training |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
@@ -181,6 +182,25 @@ updated once per observed class per minibatch with a normalized EMA.
 Validation and test never initialize or update them. Defaults are
 `hypo_loss_weight=0.1`, `hypo_compactness_weight=2`,
 `hypo_temperature=0.1`, and `hypo_prototype_momentum=0.95`.
+
+For `sdt_cse_bilevel_confusion_gap_hypo_aligned`, unrestricted HYPO
+dispersion is replaced by prototype-to-circle alignment:
+
+```text
+SDT objective
++ circular_weight * CircularCSE(learned shared gap)
++ confusion_classification_weight * confusion margin
++ hypo_loss_weight * (
+    hypo_compactness_weight * compactness
+    + hypo_alignment_weight * prototype alignment
+  )
+```
+
+Prototype alignment matches the off-diagonal cosine-similarity matrix of the
+six differentiable HYPO candidates to the matrix produced by the current
+bilevel class angles. The positive and negative HVP passes compute candidates
+without committing EMA updates. Only the ordinary training forward updates
+the prototype bank.
 
 For `sdt_cse_all_modal_cse`, the objective is:
 
@@ -574,6 +594,28 @@ python train.py \
   --gpu-id 0 \
   --seed 2024
 python train.py \
+  --experiment-mode sdt_cse_bilevel_confusion_gap_hypo_aligned \
+  --selection-protocol validation \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-gap-minimum-degrees 50 \
+  --bilevel-gap-maximum-degrees 150 \
+  --bilevel-gap-initial-degrees 90 \
+  --bilevel-angle-learning-rate 0.001 \
+  --bilevel-inner-step-size 0.0001 \
+  --bilevel-hvp-radius 0.01 \
+  --bilevel-outer-confusion-weight 0.1 \
+  --hypo-loss-weight 0.1 \
+  --hypo-compactness-weight 2 \
+  --hypo-alignment-weight 1 \
+  --hypo-temperature 0.1 \
+  --hypo-prototype-momentum 0.95 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+python train.py \
   --experiment-mode sdt_cse_bilevel_all_gaps \
   --selection-protocol validation \
   --all-gap-learning-source validation \
@@ -701,6 +743,17 @@ This starts both confusion gaps at 90 degrees and constrains them to
 hypergradient calculation, expect this launcher to take several times
 longer than the fixed-angle experiment.
 
+Run the circle-aligned HYPO hybrid over the same seeds:
+
+```bash
+GPU_ID=0 bash exec_iemocap_bilevel_confusion_gap_hypo_aligned.sh
+```
+
+This launcher uses the requested 50-150 degree range, 90-degree
+initialization, and training-only EMA prototypes. At the 150-degree upper
+bound, the four remaining circular gaps are 15 degrees; treat this wide
+range as a sensitivity experiment.
+
 Run the validation-learned six-gap experiment over seeds 2024-2033:
 
 ```bash
@@ -820,7 +873,7 @@ Learnable-angle runs additionally contain:
 - prior angles, learned angles, gaps, offsets, and target similarities in
   the checkpoint and summary.
 
-HYPO runs instead contain:
+All HYPO modes additionally contain:
 
 - `hypo_prototypes.npz` with selected prototype vectors, initialization
   flags, and per-class update counts;
@@ -828,8 +881,11 @@ HYPO runs instead contain:
   distances, hyperparameters, and selected epoch;
 - prototype-target fusion and projected-embedding geometry diagnostics.
 
-They do not write `circular_geometry.json`; circular geometry, angle, and
-circular target fields are `null` in the checkpoint and summary.
+For the aligned hybrid, `hypo_geometry.json` also records the selected
+circular target matrix and prototype-alignment MSE. The prior-free
+`sdt_hypo` mode does not write `circular_geometry.json`; its circular
+geometry, angle, and circular target fields are `null` in the checkpoint and
+summary.
 
 Spherical-residual runs additionally contain:
 

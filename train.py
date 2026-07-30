@@ -53,8 +53,10 @@ from model import (
     CONFUSION_MARGIN_MODES,
     EXPERIMENT_MODES,
     FUSION_ONLY_MODES,
+    HYPO_ALIGNMENT_MODES,
     HYPO_MODES,
     LEARNABLE_ANGLE_MODES,
+    PRIOR_FREE_HYPO_MODES,
     SDT_RESIDUAL_UPDATES,
     SDTCSEModel,
 )
@@ -88,6 +90,7 @@ LOSS_NAMES = (
     "confusion_classification_margin",
     "hypo_compactness",
     "hypo_dispersion",
+    "hypo_alignment",
     "hypo_total",
 )
 CONFUSION_PAIR_NAMES = (
@@ -298,6 +301,7 @@ def _compute_batch_losses(
     args,
     hypo_loss_function=None,
     update_hypo_prototypes=False,
+    use_batch_hypo_candidates=None,
 ):
     outputs = _model_forward(model, batch)
     losses = compute_sdt_cse_losses(
@@ -328,6 +332,11 @@ def _compute_batch_losses(
             args.hypo_compactness_weight
         ),
         update_hypo_prototypes=update_hypo_prototypes,
+        use_batch_hypo_candidates=use_batch_hypo_candidates,
+        hypo_alignment_enabled=(
+            model.experiment_mode in HYPO_ALIGNMENT_MODES
+        ),
+        hypo_alignment_weight=args.hypo_alignment_weight,
     )
     gap_prior_regularization = outputs["fusion_logits"].sum() * 0.0
     if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
@@ -378,6 +387,7 @@ def bilevel_angle_step(
     circular_loss_function,
     args,
     angle_optimizer,
+    hypo_loss_function=None,
 ):
     """Approximate a one-step validation hypergradient with DARTS HVP."""
     if model.experiment_mode not in BILEVEL_ANGLE_MODES:
@@ -475,6 +485,10 @@ def bilevel_angle_step(
                 class_weights,
                 circular_loss_function,
                 args,
+                hypo_loss_function=hypo_loss_function,
+                use_batch_hypo_candidates=(
+                    hypo_loss_function is not None
+                ),
             )
             positive_gradient = torch.autograd.grad(
                 positive_losses["total_loss"],
@@ -489,6 +503,10 @@ def bilevel_angle_step(
                 class_weights,
                 circular_loss_function,
                 args,
+                hypo_loss_function=hypo_loss_function,
+                use_batch_hypo_candidates=(
+                    hypo_loss_function is not None
+                ),
             )
             negative_gradient = torch.autograd.grad(
                 negative_losses["total_loss"],
@@ -623,6 +641,7 @@ def run_epoch(
                     circular_loss_function,
                     args,
                     bilevel_angle_optimizer,
+                    hypo_loss_function=hypo_loss_function,
                 )
                 for name in BILEVEL_METRIC_NAMES:
                     bilevel_totals[name] += bilevel_metrics[name]
@@ -1010,6 +1029,7 @@ def save_hypo_artifacts(
     hypo_loss_function,
     args,
     selected_epoch,
+    target_similarity=None,
 ):
     if hypo_loss_function is None:
         return None
@@ -1068,7 +1088,38 @@ def save_hypo_artifacts(
         "hypo_prototype_momentum": float(
             args.hypo_prototype_momentum
         ),
+        "hypo_alignment_weight": float(
+            args.hypo_alignment_weight
+        ),
     }
+    if target_similarity is not None:
+        if torch.is_tensor(target_similarity):
+            target_similarity = (
+                target_similarity.detach().cpu().numpy()
+            )
+        target_similarity = np.asarray(
+            target_similarity, dtype=np.float64
+        )
+        if target_similarity.shape != (6, 6):
+            raise ValueError(
+                "HYPO alignment target must have shape [6, 6]"
+            )
+        off_diagonal = ~np.eye(6, dtype=bool)
+        payload["circular_target_similarity"] = (
+            target_similarity.tolist()
+        )
+        payload["prototype_alignment_mse"] = float(
+            np.mean(
+                (
+                    similarities[off_diagonal]
+                    - target_similarity[off_diagonal]
+                )
+                ** 2
+            )
+        )
+    else:
+        payload["circular_target_similarity"] = None
+        payload["prototype_alignment_mse"] = None
     write_json(
         os.path.join(run_dir, "hypo_geometry.json"),
         payload,
@@ -1161,12 +1212,29 @@ def experiment_directory_name(
     hypo_compactness_weight=2.0,
     hypo_temperature=0.1,
     hypo_prototype_momentum=0.95,
+    hypo_alignment_weight=1.0,
 ):
-    if mode in HYPO_MODES:
+    if mode in PRIOR_FREE_HYPO_MODES:
         condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
             mode,
             format(float(hypo_loss_weight), "g"),
             format(float(hypo_compactness_weight), "g"),
+            format(float(hypo_temperature), "g"),
+            format(float(hypo_prototype_momentum), "g"),
+        )
+    elif mode in HYPO_ALIGNMENT_MODES:
+        condition = (
+            "{}_lambda_{}_range_{}-{}_init_{}_hlambda_{}_"
+            "w{}_a{}_tau{}_pm{}"
+        ).format(
+            mode,
+            format(float(circular_weight), "g"),
+            format(float(bilevel_gap_minimum_degrees), "g"),
+            format(float(bilevel_gap_maximum_degrees), "g"),
+            format(float(bilevel_gap_initial_degrees), "g"),
+            format(float(hypo_loss_weight), "g"),
+            format(float(hypo_compactness_weight), "g"),
+            format(float(hypo_alignment_weight), "g"),
             format(float(hypo_temperature), "g"),
             format(float(hypo_prototype_momentum), "g"),
         )
@@ -1654,7 +1722,7 @@ def save_checkpoint(
     bilevel_metrics=None,
     hypo_loss_function=None,
 ):
-    if args.experiment_mode in HYPO_MODES:
+    if args.experiment_mode in PRIOR_FREE_HYPO_MODES:
         angle_payload = {
             "circle_order": None,
             "prior_angles_radians": None,
@@ -1713,7 +1781,7 @@ def save_checkpoint(
         "circular_geometry": args.circular_geometry,
         "vad_center": (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else [
                 args.vad_center_valence,
                 args.vad_center_arousal,
@@ -1721,7 +1789,7 @@ def save_checkpoint(
         ),
         "nrc_vad_anchors": (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else build_iemocap_vad_anchors().tolist()
         ),
         "angle_weight": args.angle_weight,
@@ -1808,8 +1876,9 @@ def save_checkpoint(
         "hypo_prototype_momentum": (
             args.hypo_prototype_momentum
         ),
+        "hypo_alignment_weight": args.hypo_alignment_weight,
     }
-    if args.experiment_mode in HYPO_MODES:
+    if args.experiment_mode in PRIOR_FREE_HYPO_MODES:
         payload.update(
             {
                 "circular_geometry": None,
@@ -1904,6 +1973,7 @@ def validate_arguments(args):
         "bilevel_gap_prior_weight",
         "hypo_loss_weight",
         "hypo_compactness_weight",
+        "hypo_alignment_weight",
     ):
         value = getattr(args, name)
         if not np.isfinite(value) or value < 0:
@@ -2072,14 +2142,16 @@ def validate_arguments(args):
         args.circular_weight = 0.0
         args.circular_geometry = (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else "equal"
         )
     if args.experiment_mode not in HYPO_MODES:
         args.hypo_loss_weight = 0.0
+    if args.experiment_mode not in HYPO_ALIGNMENT_MODES:
+        args.hypo_alignment_weight = 0.0
     validated_initial_angles = (
         None
-        if args.experiment_mode in HYPO_MODES
+        if args.experiment_mode in PRIOR_FREE_HYPO_MODES
         else build_iemocap_angles(
             geometry=args.circular_geometry,
             vad_center=(
@@ -2110,7 +2182,7 @@ def validate_arguments(args):
     if args.experiment_mode not in CONFUSION_MARGIN_MODES:
         args.confused_cse_pair_weight = 1.0
         args.confusion_classification_weight = 0.0
-    if args.experiment_mode in HYPO_MODES:
+    if args.experiment_mode in PRIOR_FREE_HYPO_MODES:
         args.circular_weight = 0.0
         args.angle_weight = 0.0
         args.confusion_gap_weight = 0.0
@@ -2160,6 +2232,7 @@ def train_and_test(args):
             args.hypo_compactness_weight,
             args.hypo_temperature,
             args.hypo_prototype_momentum,
+            args.hypo_alignment_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -2178,7 +2251,7 @@ def train_and_test(args):
 
     prior_class_angles = (
         None
-        if args.experiment_mode in HYPO_MODES
+        if args.experiment_mode in PRIOR_FREE_HYPO_MODES
         else build_iemocap_angles(
             device=device,
             geometry=args.circular_geometry,
@@ -2224,7 +2297,7 @@ def train_and_test(args):
         spherical_mlp_alpha_init=args.spherical_mlp_alpha_init,
     ).to(device)
     class_weights = iemocap_class_weights(device=device)
-    if args.experiment_mode not in HYPO_MODES:
+    if args.experiment_mode not in PRIOR_FREE_HYPO_MODES:
         initial_angle_payload = angle_state_payload(
             model, prior_class_angles
         )
@@ -2366,7 +2439,7 @@ def train_and_test(args):
         )
         current_history = (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else angle_history_row(
                 epoch,
                 model,
@@ -2478,7 +2551,7 @@ def train_and_test(args):
                 "selected HYPO checkpoint has no prototype state"
             )
         hypo_loss_function.load_state_dict(hypo_state_dict)
-    if args.experiment_mode in HYPO_MODES:
+    if args.experiment_mode in PRIOR_FREE_HYPO_MODES:
         selected_angle_payload = {
             "prior_angles_radians": None,
             "class_angles_radians": None,
@@ -2506,16 +2579,25 @@ def train_and_test(args):
             prior_class_angles,
             args.minimum_confusion_gap_degrees,
         )
+    hypo_alignment_target = (
+        build_target_similarity(selected_class_angles)
+        if args.experiment_mode in HYPO_ALIGNMENT_MODES
+        else None
+    )
     hypo_geometry = save_hypo_artifacts(
         run_dir,
         hypo_loss_function,
         args,
         best_epoch,
+        target_similarity=hypo_alignment_target,
     )
     selected_target_similarity = (
-        None
-        if hypo_loss_function is None
-        else hypo_loss_function.prototype_similarity()
+        hypo_loss_function.prototype_similarity()
+        if (
+            hypo_loss_function is not None
+            and args.experiment_mode in PRIOR_FREE_HYPO_MODES
+        )
+        else None
     )
     if model.circular_angle_learner is not None:
         write_json(
@@ -2759,6 +2841,7 @@ def train_and_test(args):
         "hypo_prototype_momentum": (
             args.hypo_prototype_momentum
         ),
+        "hypo_alignment_weight": args.hypo_alignment_weight,
         "hypo_initialized_classes": (
             None
             if hypo_loss_function is None
@@ -2796,12 +2879,12 @@ def train_and_test(args):
         **selected_gap_payload,
         "circular_geometry": (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else args.circular_geometry
         ),
         "vad_center": (
             None
-            if args.experiment_mode in HYPO_MODES
+            if args.experiment_mode in PRIOR_FREE_HYPO_MODES
             else [
                 args.vad_center_valence,
                 args.vad_center_arousal,
@@ -2922,6 +3005,15 @@ def build_argument_parser():
         type=float,
         default=0.95,
         help="EMA momentum for the training-only HYPO prototypes",
+    )
+    parser.add_argument(
+        "--hypo-alignment-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "prototype-to-circular-similarity alignment weight "
+            "inside the aligned HYPO objective"
+        ),
     )
     parser.add_argument(
         "--angle-weight",

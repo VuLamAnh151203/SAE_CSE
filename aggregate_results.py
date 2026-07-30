@@ -25,6 +25,7 @@ METRICS = (
     "confusion_classification_margin",
     "hypo_compactness",
     "hypo_dispersion",
+    "hypo_alignment",
     "hypo_total",
     "happy_excited_pair_macro_f1",
     "happy_excited_pair_weighted_f1",
@@ -147,6 +148,46 @@ def condition_name(summary):
             )
         else:
             condition += "_source_{}".format(learning_source)
+    elif mode == "sdt_cse_bilevel_confusion_gap_hypo_aligned":
+        geometry = summary.get("bilevel_geometry") or {}
+        condition = (
+            "{}_lambda_{}_range_{}-{}_init_{}_hlambda_{}_"
+            "w{}_a{}_tau{}_pm{}"
+        ).format(
+            mode,
+            format(float(summary["circular_weight"]), "g"),
+            format(
+                float(geometry.get("minimum_degrees", 70.0)), "g"
+            ),
+            format(
+                float(geometry.get("maximum_degrees", 110.0)), "g"
+            ),
+            format(
+                float(geometry.get("initial_degrees", 90.0)), "g"
+            ),
+            format(
+                float(summary.get("hypo_loss_weight", 0.1)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_compactness_weight", 2.0)
+                ),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_alignment_weight", 1.0)),
+                "g",
+            ),
+            format(
+                float(summary.get("hypo_temperature", 0.1)), "g"
+            ),
+            format(
+                float(
+                    summary.get("hypo_prototype_momentum", 0.95)
+                ),
+                "g",
+            ),
+        )
     elif mode == "sdt_cse_bilevel_confusion_gap":
         geometry = summary.get("bilevel_geometry") or {}
         condition = (
@@ -368,6 +409,9 @@ def aggregate(output_dir):
             "hypo_prototype_momentum": summary.get(
                 "hypo_prototype_momentum"
             ),
+            "hypo_alignment_weight": summary.get(
+                "hypo_alignment_weight"
+            ),
             "hypo_initialized_classes": summary.get(
                 "hypo_initialized_classes"
             ),
@@ -431,6 +475,9 @@ def aggregate(output_dir):
             ),
             "hypo_prototype_momentum": condition_rows[0].get(
                 "hypo_prototype_momentum"
+            ),
+            "hypo_alignment_weight": condition_rows[0].get(
+                "hypo_alignment_weight"
             ),
         }
         for metric in METRICS:

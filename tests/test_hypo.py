@@ -18,16 +18,22 @@ if PROJECT_DIR not in sys.path:
 from aggregate_results import condition_name  # noqa: E402
 from analyze_geometry import compute_geometry_metrics  # noqa: E402
 from losses import (  # noqa: E402
+    CircularCSELoss,
     HypoPrototypeLoss,
+    build_iemocap_angles,
     compute_sdt_cse_losses,
+    iemocap_class_weights,
 )
 from model import (  # noqa: E402
     CIRCULAR_CSE_MODES,
+    HYPO_ALIGNMENT_MODES,
     HYPO_MODES,
     SDTCSEModel,
 )
 from train import (  # noqa: E402
     build_argument_parser,
+    build_bilevel_angle_optimizer,
+    bilevel_angle_step,
     experiment_directory_name,
     save_checkpoint,
     save_hypo_artifacts,
@@ -286,6 +292,57 @@ class HypoPrototypeLossTest(unittest.TestCase):
             )
         )
 
+    def test_circle_alignment_replaces_unrestricted_dispersion(self):
+        criterion = HypoPrototypeLoss(
+            6, 3, temperature=0.2, prototype_momentum=0.5
+        )
+        criterion(
+            six_embeddings(),
+            torch.arange(6),
+            update_prototypes=True,
+        )
+        before = {
+            key: value.clone()
+            for key, value in criterion.state_dict().items()
+        }
+        embeddings = (six_embeddings() + 0.15).requires_grad_()
+        outputs = minimal_outputs(embeddings)
+        outputs["class_angles"] = build_iemocap_angles()
+        losses = compute_sdt_cse_losses(
+            outputs,
+            torch.arange(6).reshape(1, 6),
+            torch.ones(1, 6),
+            torch.ones(6),
+            hypo_loss_function=criterion,
+            hypo_loss_weight=0.3,
+            hypo_compactness_weight=2.0,
+            use_batch_hypo_candidates=True,
+            hypo_alignment_enabled=True,
+            hypo_alignment_weight=0.7,
+        )
+        expected_hypo = (
+            2.0 * losses["hypo_compactness"]
+            + 0.7 * losses["hypo_alignment"]
+        )
+        self.assertEqual(
+            float(losses["hypo_dispersion"].detach()), 0.0
+        )
+        self.assertGreater(
+            float(losses["hypo_alignment"].detach()), 0.0
+        )
+        self.assertTrue(
+            torch.allclose(losses["hypo_total"], expected_hypo)
+        )
+        alignment_gradient = torch.autograd.grad(
+            losses["hypo_alignment"], embeddings
+        )[0]
+        self.assertTrue(torch.isfinite(alignment_gradient).all())
+        self.assertGreater(
+            float(alignment_gradient.abs().sum()), 0.0
+        )
+        for key, value in criterion.state_dict().items():
+            self.assertTrue(torch.equal(value, before[key]))
+
 
 class HypoIntegrationTest(unittest.TestCase):
     @staticmethod
@@ -468,6 +525,197 @@ class HypoIntegrationTest(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 validate_arguments(invalid)
+
+    def test_aligned_bilevel_mode_keeps_both_geometries(self):
+        mode = "sdt_cse_bilevel_confusion_gap_hypo_aligned"
+        self.assertIn(mode, HYPO_MODES)
+        self.assertIn(mode, HYPO_ALIGNMENT_MODES)
+        self.assertIn(mode, CIRCULAR_CSE_MODES)
+        model = SDTCSEModel(
+            d_text=5,
+            d_visual=4,
+            d_audio=3,
+            n_head=2,
+            n_classes=6,
+            hidden_dim=8,
+            n_speakers=2,
+            dropout=0.0,
+            experiment_mode=mode,
+            embedding_dim=3,
+            projection_dropout=0.0,
+            bilevel_gap_minimum_degrees=50.0,
+            bilevel_gap_maximum_degrees=150.0,
+            bilevel_gap_initial_degrees=90.0,
+        )
+        self.assertIsNotNone(model.circular_angle_learner)
+        self.assertIsNotNone(model.fusion_projector)
+        self.assertIsNotNone(model.t_output_layer)
+
+        parser = build_argument_parser()
+        args = parser.parse_args(
+            [
+                "--experiment-mode",
+                mode,
+                "--bilevel-gap-minimum-degrees",
+                "50",
+                "--bilevel-gap-maximum-degrees",
+                "150",
+                "--bilevel-gap-initial-degrees",
+                "90",
+            ]
+        )
+        validate_arguments(args)
+        self.assertEqual(args.circular_weight, 0.1)
+        self.assertEqual(args.hypo_loss_weight, 0.1)
+        self.assertEqual(args.hypo_alignment_weight, 1.0)
+        condition = experiment_directory_name(
+            mode,
+            args.circular_weight,
+            args.circular_geometry,
+            bilevel_gap_minimum_degrees=50.0,
+            bilevel_gap_maximum_degrees=150.0,
+            bilevel_gap_initial_degrees=90.0,
+            confused_cse_pair_weight=5.0,
+            confusion_classification_margin=0.1,
+            confusion_classification_weight=0.1,
+            bilevel_angle_learning_rate=0.001,
+            bilevel_outer_confusion_weight=0.1,
+            hypo_loss_weight=0.1,
+            hypo_compactness_weight=2.0,
+            hypo_alignment_weight=1.0,
+            hypo_temperature=0.1,
+            hypo_prototype_momentum=0.95,
+        )
+        self.assertIn("_range_50-150_init_90_", condition)
+        self.assertIn(
+            "_hlambda_0.1_w2_a1_tau0.1_pm0.95",
+            condition,
+        )
+        summary = {
+            "experiment_mode": mode,
+            "circular_weight": 0.1,
+            "confused_cse_pair_weight": 5.0,
+            "confusion_classification_margin": 0.1,
+            "confusion_classification_weight": 0.1,
+            "hypo_loss_weight": 0.1,
+            "hypo_compactness_weight": 2.0,
+            "hypo_alignment_weight": 1.0,
+            "hypo_temperature": 0.1,
+            "hypo_prototype_momentum": 0.95,
+            "bilevel_geometry": {
+                "minimum_degrees": 50.0,
+                "maximum_degrees": 150.0,
+                "initial_degrees": 90.0,
+                "angle_learning_rate": 0.001,
+                "outer_confusion_weight": 0.1,
+            },
+        }
+        self.assertEqual(condition_name(summary), condition)
+
+    def test_bilevel_hvp_never_commits_hypo_candidates(self):
+        torch.manual_seed(29)
+        mode = "sdt_cse_bilevel_confusion_gap_hypo_aligned"
+        model = SDTCSEModel(
+            d_text=5,
+            d_visual=4,
+            d_audio=3,
+            n_head=2,
+            n_classes=6,
+            hidden_dim=8,
+            n_speakers=2,
+            dropout=0.0,
+            experiment_mode=mode,
+            embedding_dim=3,
+            projection_dropout=0.0,
+            bilevel_gap_minimum_degrees=50.0,
+            bilevel_gap_maximum_degrees=150.0,
+            bilevel_gap_initial_degrees=90.0,
+        )
+        utterance_mask = torch.tensor(
+            [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0]]
+        )
+        speaker_mask = torch.tensor(
+            [
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                ],
+                [
+                    [0.0, 1.0],
+                    [1.0, 0.0],
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                ],
+            ]
+        )
+        batch = {
+            "text": torch.randn(4, 2, 5),
+            "visual": torch.randn(4, 2, 4),
+            "audio": torch.randn(4, 2, 3),
+            "utterance_mask": utterance_mask,
+            "speaker_mask": speaker_mask.permute(1, 0, 2),
+            "labels": torch.tensor(
+                [[0, 4, 3, 5], [1, 2, 0, 0]]
+            ),
+        }
+        validation_batch = {
+            key: value.clone() for key, value in batch.items()
+        }
+        validation_batch["text"] += 0.03
+        parser = build_argument_parser()
+        args = parser.parse_args(
+            [
+                "--experiment-mode",
+                mode,
+                "--bilevel-gap-minimum-degrees",
+                "50",
+                "--bilevel-gap-maximum-degrees",
+                "150",
+                "--bilevel-gap-initial-degrees",
+                "90",
+                "--bilevel-angle-learning-rate",
+                "0.01",
+                "--bilevel-inner-step-size",
+                "0.001",
+                "--bilevel-hvp-radius",
+                "0.01",
+            ]
+        )
+        validate_arguments(args)
+        hypo = HypoPrototypeLoss(6, 3)
+        hypo(
+            six_embeddings(),
+            torch.arange(6),
+            update_prototypes=True,
+        )
+        counts_before = hypo.update_counts.clone()
+        prototypes_before = hypo.prototypes.clone()
+        angles = model.current_circular_angle_state()[
+            "angles"
+        ].detach()
+        circular = CircularCSELoss(
+            class_angles=angles,
+            confusion_pair_weight=5.0,
+        )
+        metrics = bilevel_angle_step(
+            model,
+            batch,
+            validation_batch,
+            iemocap_class_weights(),
+            circular,
+            args,
+            build_bilevel_angle_optimizer(model, 0.01),
+            hypo_loss_function=hypo,
+        )
+        self.assertTrue(
+            math.isfinite(metrics["bilevel_hypergradient_norm"])
+        )
+        self.assertTrue(torch.equal(hypo.update_counts, counts_before))
+        self.assertTrue(
+            torch.equal(hypo.prototypes, prototypes_before)
+        )
 
     def test_artifacts_and_prototype_target_geometry(self):
         criterion = HypoPrototypeLoss(6, 3)

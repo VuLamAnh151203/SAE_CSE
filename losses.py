@@ -526,7 +526,14 @@ class HypoPrototypeLoss(nn.Module):
         )
         return torch.matmul(prototypes, prototypes.t())
 
-    def forward(self, embeddings, labels, update_prototypes=False):
+    def forward(
+        self,
+        embeddings,
+        labels,
+        update_prototypes=False,
+        use_batch_candidates=None,
+        target_similarity=None,
+    ):
         if embeddings.ndim != 2:
             raise ValueError("embeddings must have shape [N, D]")
         if embeddings.size(1) != self.embedding_dim:
@@ -546,6 +553,14 @@ class HypoPrototypeLoss(nn.Module):
                 raise ValueError("labels must be nonnegative")
             if labels.max().item() >= self.num_classes:
                 raise ValueError("label exceeds the configured class count")
+        if use_batch_candidates is None:
+            use_batch_candidates = bool(update_prototypes)
+        else:
+            use_batch_candidates = bool(use_batch_candidates)
+        if update_prototypes and not use_batch_candidates:
+            raise ValueError(
+                "prototype updates require batch candidates"
+            )
 
         embeddings = F.normalize(
             embeddings, p=2, dim=-1, eps=1e-8
@@ -555,6 +570,7 @@ class HypoPrototypeLoss(nn.Module):
             return {
                 "compactness": zero,
                 "dispersion": zero,
+                "alignment": zero,
                 "active": False,
             }
 
@@ -565,7 +581,7 @@ class HypoPrototypeLoss(nn.Module):
             class_observed = bool(class_selected.any().item())
             observed.append(class_observed)
             current = self.prototypes[class_id].detach()
-            if not update_prototypes or not class_observed:
+            if not use_batch_candidates or not class_observed:
                 candidate = current
             else:
                 class_mean = F.normalize(
@@ -623,6 +639,7 @@ class HypoPrototypeLoss(nn.Module):
             return {
                 "compactness": zero,
                 "dispersion": zero,
+                "alignment": zero,
                 "active": False,
             }
 
@@ -639,9 +656,10 @@ class HypoPrototypeLoss(nn.Module):
         dispersion_prototypes = F.normalize(
             candidates, p=2, dim=-1, eps=1e-8
         )
-        similarities = torch.matmul(
+        prototype_similarity = torch.matmul(
             dispersion_prototypes, dispersion_prototypes.t()
-        ) / self.temperature
+        )
+        similarities = prototype_similarity / self.temperature
         off_diagonal = ~torch.eye(
             self.num_classes,
             dtype=torch.bool,
@@ -654,9 +672,39 @@ class HypoPrototypeLoss(nn.Module):
             torch.logsumexp(negative_similarities, dim=1)
             - math.log(self.num_classes - 1)
         ).mean()
+        alignment = zero
+        if target_similarity is not None:
+            if torch.is_tensor(target_similarity):
+                target_similarity = target_similarity.to(
+                    device=prototype_similarity.device,
+                    dtype=prototype_similarity.dtype,
+                )
+            else:
+                target_similarity = torch.as_tensor(
+                    target_similarity,
+                    device=prototype_similarity.device,
+                    dtype=prototype_similarity.dtype,
+                )
+            if target_similarity.shape != (
+                self.num_classes,
+                self.num_classes,
+            ):
+                raise ValueError(
+                    "target_similarity must have shape [C, C]"
+                )
+            if not torch.isfinite(target_similarity).all():
+                raise ValueError(
+                    "target_similarity must contain finite values"
+                )
+            alignment = F.mse_loss(
+                prototype_similarity[off_diagonal],
+                target_similarity[off_diagonal],
+                reduction="mean",
+            )
         return {
             "compactness": compactness,
             "dispersion": dispersion,
+            "alignment": alignment,
             "active": True,
         }
 
@@ -681,6 +729,9 @@ def compute_sdt_cse_losses(
     hypo_loss_weight=0.0,
     hypo_compactness_weight=2.0,
     update_hypo_prototypes=False,
+    use_batch_hypo_candidates=None,
+    hypo_alignment_enabled=False,
+    hypo_alignment_weight=0.0,
 ):
     for name, value in {
         "fusion_ce_weight": fusion_ce_weight,
@@ -689,6 +740,7 @@ def compute_sdt_cse_losses(
         "circular_weight": circular_weight,
         "hypo_loss_weight": hypo_loss_weight,
         "hypo_compactness_weight": hypo_compactness_weight,
+        "hypo_alignment_weight": hypo_alignment_weight,
         "angle_weight": angle_weight,
         "confusion_gap_weight": confusion_gap_weight,
         "confusion_classification_weight": (
@@ -827,6 +879,7 @@ def compute_sdt_cse_losses(
     total_circular = fusion_circular + unimodal_circular
     hypo_compactness = circular_zero
     hypo_dispersion = circular_zero
+    hypo_alignment = circular_zero
     if hypo_loss_function is not None:
         if outputs["embeddings"] is None:
             raise ValueError(
@@ -837,20 +890,39 @@ def compute_sdt_cse_losses(
             -1, outputs["embeddings"].size(-1)
         )[valid]
         valid_labels = labels.reshape(-1)[valid]
+        target_similarity = None
+        if hypo_alignment_enabled:
+            class_angles = outputs.get("class_angles")
+            if class_angles is None:
+                raise ValueError(
+                    "circle-aligned HYPO requires class angles"
+                )
+            target_similarity = build_target_similarity(
+                class_angles
+            )
         hypo_components = hypo_loss_function(
             valid_embeddings,
             valid_labels,
             update_prototypes=update_hypo_prototypes,
+            use_batch_candidates=use_batch_hypo_candidates,
+            target_similarity=target_similarity,
         )
         hypo_compactness = hypo_components["compactness"]
-        hypo_dispersion = hypo_components["dispersion"]
+        if hypo_alignment_enabled:
+            hypo_alignment = hypo_components["alignment"]
+        else:
+            hypo_dispersion = hypo_components["dispersion"]
     elif hypo_loss_weight > 0:
         raise ValueError(
             "positive hypo_loss_weight requires a HYPO prototype loss"
         )
     hypo_total = (
         hypo_compactness_weight * hypo_compactness
-        + hypo_dispersion
+        + (
+            hypo_alignment_weight * hypo_alignment
+            if hypo_alignment_enabled
+            else hypo_dispersion
+        )
     )
     angle_regularization = outputs["fusion_logits"].sum() * 0.0
     if outputs.get("angle_regularization") is not None:
@@ -932,6 +1004,7 @@ def compute_sdt_cse_losses(
         "total_circular_cse": total_circular,
         "hypo_compactness": hypo_compactness,
         "hypo_dispersion": hypo_dispersion,
+        "hypo_alignment": hypo_alignment,
         "hypo_total": hypo_total,
         "angle_regularization": angle_regularization,
         "confusion_gap_regularization": (
