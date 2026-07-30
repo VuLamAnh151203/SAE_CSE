@@ -186,6 +186,26 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_bilevel_all_gaps",
+                0.1,
+                "equal",
+                confused_cse_pair_weight=5.0,
+                confusion_classification_margin=0.1,
+                confusion_classification_weight=0.1,
+                bilevel_angle_learning_rate=0.001,
+                bilevel_outer_confusion_weight=0.1,
+                bilevel_all_gaps_initialization="equal",
+                bilevel_minimum_class_gap_degrees=20.0,
+                bilevel_gap_prior_weight=0.01,
+            ),
+            (
+                "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
+                "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_anglelr_0.001_outerconf_0.1"
+            ),
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse",
                 0.1,
                 "equal",
@@ -295,6 +315,62 @@ class FixedSplitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_arguments(invalid_bilevel)
 
+        all_gaps = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+            ]
+        )
+        validate_arguments(all_gaps)
+        self.assertEqual(all_gaps.circular_geometry, "equal")
+        self.assertEqual(
+            all_gaps.bilevel_all_gaps_initialization, "equal"
+        )
+        self.assertEqual(
+            all_gaps.bilevel_minimum_class_gap_degrees, 20.0
+        )
+        self.assertEqual(all_gaps.bilevel_gap_prior_weight, 0.01)
+        self.assertEqual(all_gaps.selection_protocol, "validation")
+        self.assertEqual(all_gaps.confused_cse_pair_weight, 5.0)
+        self.assertEqual(
+            all_gaps.confusion_classification_weight, 0.1
+        )
+
+        nrc_all_gaps = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--bilevel-all-gaps-initialization",
+                "nrc_vad",
+                "--bilevel-minimum-class-gap-degrees",
+                "5",
+            ]
+        )
+        validate_arguments(nrc_all_gaps)
+        self.assertEqual(nrc_all_gaps.circular_geometry, "nrc_vad")
+
+        invalid_nrc_floor = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--bilevel-all-gaps-initialization",
+                "nrc_vad",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_nrc_floor)
+
+        invalid_all_gaps = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--selection-protocol",
+                "test",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_all_gaps)
+
         fixed = parser.parse_args(
             ["--experiment-mode", "sdt_cse"]
         )
@@ -385,6 +461,31 @@ class FixedSplitTest(unittest.TestCase):
             (
                 "sdt_cse_bilevel_confusion_gap_lambda_0.1_"
                 "range_70-110_init_90_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_anglelr_0.001_outerconf_0.1"
+            ),
+        )
+        all_gaps = dict(summary)
+        all_gaps.update(
+            {
+                "experiment_mode": "sdt_cse_bilevel_all_gaps",
+                "selection_protocol": "validation",
+                "bilevel_geometry": {
+                    "initialization": "equal",
+                    "minimum_class_gap_degrees": 20.0,
+                    "gap_prior_weight": 0.01,
+                    "angle_learning_rate": 0.001,
+                    "outer_confusion_weight": 0.1,
+                },
+                "confused_cse_pair_weight": 5.0,
+                "confusion_classification_margin": 0.1,
+                "confusion_classification_weight": 0.1,
+            }
+        )
+        self.assertEqual(
+            condition_name(all_gaps),
+            (
+                "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
+                "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
                 "clsweight_0.1_anglelr_0.001_outerconf_0.1"
             ),
         )

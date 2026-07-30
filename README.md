@@ -20,6 +20,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 | `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
+| `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | All six ordered gaps learned from validation classification |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -61,6 +62,9 @@ The comparisons have distinct purposes:
 - `sdt_cse_bilevel_confusion_gap - sdt_cse_confusion_margin` replaces the
   fixed gap by one bounded shared gap whose hypergradient comes from
   validation fusion classification.
+- `sdt_cse_bilevel_all_gaps - sdt_cse_bilevel_confusion_gap` removes the
+  equal-confusion/equal-remaining-gap restriction and validation-learns all
+  six consecutive gaps while preserving their circular order.
 
 ## Internal spherical residuals
 
@@ -274,6 +278,40 @@ is Adam. It performs three additional forward/backward evaluations per
 training minibatch and is therefore substantially slower than fixed-angle
 training.
 
+For `sdt_cse_bilevel_all_gaps`, every consecutive gap has its own learned
+allocation:
+
+```text
+gap_c = minimum_gap
+        + (360 - 6 * minimum_gap) * softmax(raw_gaps)_c
+```
+
+The six gaps are ordered as happy-to-excited, excited-to-angry,
+angry-to-frustrated, frustrated-to-sad, sad-to-neutral, and
+neutral-to-happy. This guarantees that every gap is strictly larger than the
+configured minimum, their sum is exactly 360 degrees, and the class order
+cannot change. Equal initialization starts all gaps at 60 degrees.
+
+The all-gap outer objective adds:
+
+```text
+bilevel_gap_prior_weight
+* sum((learned_gap - initialization_gap)^2)
+```
+
+The default minimum is 20 degrees and the prior weight is `0.01`. Set the
+prior weight to zero for fully validation-driven spacing while retaining the
+hard minimum. The validation classification objective remains fusion CE plus
+the confused-pair cosine margin; validation weighted F1 remains the
+checkpoint-selection metric. The squared prior penalty is computed in
+radians internally.
+
+NRC-VAD initialization is also available with
+`--bilevel-all-gaps-initialization nrc_vad`, but its smallest prior gap is
+about 19.8 degrees. Therefore, set
+`--bilevel-minimum-class-gap-degrees` below that value, such as 10 degrees.
+The program rejects an initialization that violates the configured floor.
+
 The emotion order is:
 
 ```text
@@ -304,8 +342,10 @@ architecture:
 
 Fixed-angle modes default to `equal`. The learnable-angle mode defaults to
 `nrc_vad`; either prior can be selected explicitly. The
-`sdt_cse_confusion_margin` and bilevel confusion-gap modes require
-`confusion_separated`; the bilevel mode replaces its fixed angles dynamically.
+`sdt_cse_confusion_margin` and the shared-gap bilevel mode require
+`confusion_separated`; the shared-gap bilevel mode replaces those fixed
+angles dynamically. The all-gap bilevel mode defaults to `equal`
+initialization and then learns all six gaps dynamically.
 
 The nonuniform version uses:
 
@@ -482,6 +522,23 @@ python train.py \
   --device cuda \
   --gpu-id 0 \
   --seed 2024
+python train.py \
+  --experiment-mode sdt_cse_bilevel_all_gaps \
+  --selection-protocol validation \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-all-gaps-initialization equal \
+  --bilevel-minimum-class-gap-degrees 20 \
+  --bilevel-gap-prior-weight 0.01 \
+  --bilevel-angle-learning-rate 0.001 \
+  --bilevel-inner-step-size 0.0001 \
+  --bilevel-hvp-radius 0.01 \
+  --bilevel-outer-confusion-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
 ```
 
 Run standard SDT-CSE with the original SDT test-selection behavior:
@@ -572,6 +629,17 @@ This starts both confusion gaps at 90 degrees and constrains them to
 70-110 degrees. Because each training minibatch requires a validation
 hypergradient calculation, expect this launcher to take several times
 longer than the fixed-angle experiment.
+
+Run the validation-learned six-gap experiment over seeds 2024-2033:
+
+```bash
+GPU_ID=0 bash exec_iemocap_bilevel_all_gaps.sh
+```
+
+It starts from six equal 60-degree gaps, enforces a 20-degree minimum for
+each gap, and records all six learned values in `angle_history.csv`,
+`bilevel_gap_history.csv`, checkpoints, per-seed summaries, and aggregate
+CSV files.
 
 Run all experiment modes over ten initialization seeds and aggregate them:
 

@@ -24,6 +24,7 @@ from losses import (  # noqa: E402
     minimum_confusion_gap_regularization,
 )
 from model import (  # noqa: E402
+    BilevelAllGapsAngles,
     BilevelConfusionGapAngles,
     CIRCLE_ORDER,
     CosineEmotionClassifier,
@@ -103,6 +104,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse_learnable_angles_confusion_gap",
             "sdt_cse_confusion_margin",
             "sdt_cse_bilevel_confusion_gap",
+            "sdt_cse_bilevel_all_gaps",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
@@ -212,6 +214,7 @@ class ModelModeTest(unittest.TestCase):
                 "sdt_cse_learnable_angles",
                 "sdt_cse_learnable_angles_confusion_gap",
                 "sdt_cse_bilevel_confusion_gap",
+                "sdt_cse_bilevel_all_gaps",
             ):
                 self.assertIsNotNone(model.circular_angle_learner)
                 self.assertEqual(outputs["class_angles"].shape, (6,))
@@ -232,6 +235,7 @@ class ModelModeTest(unittest.TestCase):
                 in (
                     "sdt_cse_confusion_margin",
                     "sdt_cse_bilevel_confusion_gap",
+                    "sdt_cse_bilevel_all_gaps",
                 ),
             )
 
@@ -812,7 +816,9 @@ class BilevelConfusionGapTest(unittest.TestCase):
             maximum_gap_degrees=110.0,
             initial_gap_degrees=90.0,
         )
-        initial_gaps = torch.rad2deg(learner.normalized_gaps())
+        initial_gaps = torch.rad2deg(
+            learner.normalized_gaps().detach()
+        )
         self.assertTrue(
             torch.allclose(
                 initial_gaps,
@@ -972,6 +978,251 @@ class BilevelConfusionGapTest(unittest.TestCase):
             geometry["selected_confusion_gap_degrees"], 90.0
         )
         restored = make_model("sdt_cse_bilevel_confusion_gap")
+        restored.load_state_dict(checkpoint["model_state_dict"])
+        self.assertTrue(
+            torch.allclose(
+                restored.circular_angle_learner.raw_gaps,
+                model.circular_angle_learner.raw_gaps,
+            )
+        )
+
+
+class BilevelAllGapsTest(unittest.TestCase):
+    def test_equal_and_nrc_initialization_reproduce_targets(self):
+        for geometry, minimum in (("equal", 20.0), ("nrc_vad", 5.0)):
+            prior = build_iemocap_angles(geometry=geometry)
+            learner = BilevelAllGapsAngles(
+                minimum_gap_degrees=minimum,
+                prior_angles=prior,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    build_target_similarity(learner()),
+                    build_target_similarity(prior),
+                    atol=1e-6,
+                )
+            )
+
+    def test_all_gaps_preserve_floor_order_and_circumference(self):
+        prior = build_iemocap_angles(geometry="equal")
+        learner = BilevelAllGapsAngles(
+            minimum_gap_degrees=20.0,
+            prior_angles=prior,
+        )
+        initial_gaps = torch.rad2deg(
+            learner.normalized_gaps().detach()
+        )
+        self.assertTrue(
+            torch.allclose(
+                initial_gaps,
+                torch.full((6,), 60.0),
+                atol=1e-5,
+            )
+        )
+        self.assertAlmostEqual(
+            float(
+                learner.gap_prior_regularization()
+                .detach()
+                .item()
+            ),
+            0.0,
+            places=6,
+        )
+
+        with torch.no_grad():
+            learner.raw_gaps.copy_(
+                torch.tensor([3.0, -2.0, 1.0, 0.0, -1.0, 2.0])
+            )
+        gaps = torch.rad2deg(learner.normalized_gaps().detach())
+        angles = torch.rad2deg(learner().detach())
+        self.assertTrue(torch.all(gaps > 20.0))
+        self.assertAlmostEqual(float(gaps.sum()), 360.0, places=4)
+        self.assertAlmostEqual(float(angles[0]), 0.0, places=5)
+        ordered_angles = angles[torch.tensor(CIRCLE_ORDER)]
+        self.assertTrue(
+            torch.all(ordered_angles[1:] > ordered_angles[:-1])
+        )
+        self.assertGreater(
+            float(
+                learner.gap_prior_regularization()
+                .detach()
+                .item()
+            ),
+            0.0,
+        )
+        learner.gap_prior_regularization().backward()
+        self.assertTrue(
+            torch.isfinite(learner.raw_gaps.grad).all()
+        )
+        self.assertGreater(
+            float(learner.raw_gaps.grad.abs().sum()), 0.0
+        )
+
+    def test_all_gap_optimizer_is_outer_only_and_vector_valued(self):
+        model = make_model("sdt_cse_bilevel_all_gaps")
+        inner = build_optimizer(
+            model,
+            1e-4,
+            1e-5,
+            exclude_angle_parameters=True,
+        )
+        outer = build_bilevel_angle_optimizer(model, 1e-3)
+        raw = model.circular_angle_learner.raw_gaps
+        self.assertEqual(tuple(raw.shape), (6,))
+        inner_ids = {
+            id(parameter)
+            for group in inner.param_groups
+            for parameter in group["params"]
+        }
+        outer_parameters = [
+            parameter
+            for group in outer.param_groups
+            for parameter in group["params"]
+        ]
+        self.assertNotIn(id(raw), inner_ids)
+        self.assertEqual(outer_parameters, [raw])
+        self.assertTrue(
+            all(
+                group["weight_decay"] == 0.0
+                for group in outer.param_groups
+            )
+        )
+
+    def test_validation_hypergradient_learns_six_constrained_gaps(self):
+        torch.manual_seed(193)
+        model = make_model("sdt_cse_bilevel_all_gaps")
+        inputs = make_inputs()
+        batch = {
+            "text": inputs[0],
+            "visual": inputs[1],
+            "audio": inputs[2],
+            "utterance_mask": inputs[3],
+            "speaker_mask": inputs[4].permute(1, 0, 2),
+            "labels": torch.tensor(
+                [[0, 4, 3, 5], [1, 2, 0, 0]]
+            ),
+        }
+        validation_batch = {
+            key: value.clone() for key, value in batch.items()
+        }
+        validation_batch["audio"] = (
+            validation_batch["audio"] - 0.07
+        )
+        args = build_argument_parser().parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--bilevel-angle-learning-rate",
+                "0.01",
+                "--bilevel-inner-step-size",
+                "0.001",
+                "--bilevel-hvp-radius",
+                "0.01",
+                "--bilevel-gap-prior-weight",
+                "0.01",
+            ]
+        )
+        validate_arguments(args)
+        criterion = CircularCSELoss(
+            class_angles=build_iemocap_angles(geometry="equal"),
+            confusion_pair_weight=5.0,
+        )
+        outer = build_bilevel_angle_optimizer(model, 0.01)
+        raw_before = (
+            model.circular_angle_learner.raw_gaps.detach().clone()
+        )
+        weight_before = (
+            model.cosine_classifier.class_weights.detach().clone()
+        )
+        metrics = bilevel_angle_step(
+            model,
+            batch,
+            validation_batch,
+            iemocap_class_weights(),
+            criterion,
+            args,
+            outer,
+        )
+        raw_after = model.circular_angle_learner.raw_gaps.detach()
+        gaps_after = torch.rad2deg(
+            model.circular_angle_learner.normalized_gaps().detach()
+        )
+        self.assertTrue(
+            math.isfinite(metrics["bilevel_hypergradient_norm"])
+        )
+        self.assertGreater(
+            metrics["bilevel_hypergradient_norm"], 0.0
+        )
+        self.assertGreater(
+            metrics["bilevel_gap_change_l2_degrees"], 0.0
+        )
+        self.assertFalse(torch.allclose(raw_before, raw_after))
+        self.assertTrue(torch.all(gaps_after > 20.0))
+        self.assertAlmostEqual(
+            float(gaps_after.sum()), 360.0, places=4
+        )
+        self.assertTrue(
+            torch.allclose(
+                model.cosine_classifier.class_weights,
+                weight_before,
+            )
+        )
+
+    def test_minimum_gap_must_fit_initialization(self):
+        prior = build_iemocap_angles(geometry="equal")
+        with self.assertRaises(ValueError):
+            BilevelAllGapsAngles(
+                minimum_gap_degrees=60.0,
+                prior_angles=prior,
+            )
+
+    def test_checkpoint_restores_all_six_gaps_and_outer_optimizer(self):
+        model = make_model("sdt_cse_bilevel_all_gaps")
+        with torch.no_grad():
+            model.circular_angle_learner.raw_gaps.copy_(
+                torch.tensor([0.5, -0.5, 0.2, -0.2, 0.1, -0.1])
+            )
+        inner = build_optimizer(
+            model,
+            1e-4,
+            1e-5,
+            exclude_angle_parameters=True,
+        )
+        outer = build_bilevel_angle_optimizer(model, 1e-3)
+        args = build_argument_parser().parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+            ]
+        )
+        validate_arguments(args)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pt")
+            save_checkpoint(
+                path,
+                model,
+                inner,
+                args,
+                {
+                    "training": ["train"],
+                    "validation": ["valid"],
+                    "testing": ["test"],
+                },
+                epoch=3,
+                validation_metrics={"weighted_f1": 51.0},
+                angle_optimizer=outer,
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+        geometry = checkpoint["bilevel_geometry"]
+        self.assertEqual(len(geometry["raw_parameters"]), 6)
+        self.assertEqual(
+            len(geometry["normalized_gaps_degrees"]), 6
+        )
+        self.assertEqual(len(geometry["named_gaps_degrees"]), 6)
+        self.assertIsNotNone(
+            checkpoint["angle_optimizer_state_dict"]
+        )
+        restored = make_model("sdt_cse_bilevel_all_gaps")
         restored.load_state_dict(checkpoint["model_state_dict"])
         self.assertTrue(
             torch.allclose(

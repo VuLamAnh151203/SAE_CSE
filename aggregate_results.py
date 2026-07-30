@@ -29,6 +29,14 @@ METRICS = (
     "angry_frustrated_pair_weighted_f1",
     "angry_frustrated_mutual_confusion_rate",
 )
+ORDERED_GAP_NAMES = (
+    "happy_to_excited",
+    "excited_to_angry",
+    "angry_to_frustrated",
+    "frustrated_to_sad",
+    "sad_to_neutral",
+    "neutral_to_happy",
+)
 
 
 def load_summaries(output_dir):
@@ -46,7 +54,57 @@ def load_summaries(output_dir):
 
 def condition_name(summary):
     mode = summary["experiment_mode"]
-    if mode == "sdt_cse_bilevel_confusion_gap":
+    if mode == "sdt_cse_bilevel_all_gaps":
+        geometry = summary.get("bilevel_geometry") or {}
+        condition = (
+            "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+        ).format(
+            mode,
+            format(float(summary["circular_weight"]), "g"),
+            geometry.get("initialization", "equal"),
+            format(
+                float(
+                    geometry.get(
+                        "minimum_class_gap_degrees", 20.0
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(geometry.get("gap_prior_weight", 0.01)),
+                "g",
+            ),
+            format(
+                float(summary.get("confused_cse_pair_weight", 5.0)),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_margin", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(
+                    summary.get(
+                        "confusion_classification_weight", 0.1
+                    )
+                ),
+                "g",
+            ),
+            format(
+                float(geometry.get("angle_learning_rate", 0.001)),
+                "g",
+            ),
+            format(
+                float(geometry.get("outer_confusion_weight", 0.1)),
+                "g",
+            ),
+        )
+    elif mode == "sdt_cse_bilevel_confusion_gap":
         geometry = summary.get("bilevel_geometry") or {}
         condition = (
             "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
@@ -248,6 +306,10 @@ def aggregate(output_dir):
     grouped = {}
     for summary in summaries:
         condition = condition_name(summary)
+        bilevel_geometry = summary.get("bilevel_geometry") or {}
+        named_gaps = bilevel_geometry.get(
+            "named_gaps_degrees", {}
+        )
         row = {
             "condition": condition,
             "seed": summary["seed"],
@@ -256,11 +318,30 @@ def aggregate(output_dir):
                 "sdt_residual_update", "standard"
             ),
             "selected_bilevel_gap_degrees": (
-                (summary.get("bilevel_geometry") or {}).get(
+                bilevel_geometry.get(
                     "selected_confusion_gap_degrees"
                 )
             ),
+            "selected_bilevel_minimum_gap_degrees": (
+                bilevel_geometry.get(
+                    "selected_minimum_gap_degrees"
+                )
+            ),
+            "selected_bilevel_maximum_gap_degrees": (
+                bilevel_geometry.get(
+                    "selected_maximum_gap_degrees"
+                )
+            ),
+            "selected_bilevel_gap_prior_regularization": (
+                bilevel_geometry.get(
+                    "gap_prior_regularization"
+                )
+            ),
         }
+        for gap_name in ORDERED_GAP_NAMES:
+            row[
+                "selected_gap_{}_degrees".format(gap_name)
+            ] = named_gaps.get(gap_name)
         validation = summary.get("validation") or {}
         for metric in METRICS:
             row["test_{}".format(metric)] = summary["test"].get(metric)
@@ -324,6 +405,13 @@ def aggregate(output_dir):
             "final_alpha_min",
             "final_alpha_max",
             "selected_bilevel_gap_degrees",
+            "selected_bilevel_minimum_gap_degrees",
+            "selected_bilevel_maximum_gap_degrees",
+            "selected_bilevel_gap_prior_regularization",
+            *(
+                "selected_gap_{}_degrees".format(name)
+                for name in ORDERED_GAP_NAMES
+            ),
         ):
             values = np.asarray(
                 [

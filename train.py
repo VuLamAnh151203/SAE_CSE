@@ -42,7 +42,10 @@ from losses import (
     minimum_confusion_gap_regularization,
 )
 from model import (
+    BILEVEL_ALL_GAP_MODES,
     BILEVEL_ANGLE_MODES,
+    BILEVEL_SHARED_GAP_MODES,
+    BilevelAllGapsAngles,
     CIRCLE_ORDER,
     CIRCULAR_CSE_MODES,
     CONFUSION_GAP_MODES,
@@ -96,9 +99,12 @@ CONFUSION_PAIR_METRIC_NAMES = tuple(
 )
 BILEVEL_METRIC_NAMES = (
     "bilevel_outer_classification_loss",
+    "bilevel_gap_prior_regularization",
     "bilevel_hypergradient",
+    "bilevel_hypergradient_norm",
     "bilevel_gap_before_degrees",
     "bilevel_gap_after_degrees",
+    "bilevel_gap_change_l2_degrees",
     "bilevel_updates",
 )
 
@@ -344,7 +350,7 @@ def bilevel_angle_step(
     angle_parameters = tuple(learner.parameters())
     if len(angle_parameters) != 1:
         raise ValueError(
-            "bilevel shared-gap mode requires one angle parameter"
+            "bilevel mode requires one raw-gap parameter tensor"
         )
     angle_parameter = angle_parameters[0]
     angle_ids = {id(parameter) for parameter in angle_parameters}
@@ -358,9 +364,17 @@ def bilevel_angle_step(
 
     was_training = model.training
     model.eval()
-    gap_before = float(
-        torch.rad2deg(learner.confusion_gap()).detach().cpu().item()
+    gaps_before = torch.rad2deg(
+        learner.normalized_gaps()
+    ).detach()
+    representative_gap_before = float(
+        (
+            gaps_before[0]
+            if model.experiment_mode in BILEVEL_SHARED_GAP_MODES
+            else gaps_before.min()
+        ).cpu().item()
     )
+    gap_prior_regularization = angle_parameter.new_zeros(())
     try:
         validation_outputs = _model_forward(
             model, validation_batch
@@ -447,6 +461,17 @@ def bilevel_angle_step(
             * (positive_gradient - negative_gradient)
             / (2.0 * epsilon)
         )
+        if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
+            gap_prior_regularization = (
+                learner.gap_prior_regularization()
+            )
+            if args.bilevel_gap_prior_weight > 0.0:
+                prior_gradient = torch.autograd.grad(
+                    args.bilevel_gap_prior_weight
+                    * gap_prior_regularization,
+                    angle_parameter,
+                )[0]
+                hypergradient = hypergradient + prior_gradient
         if not torch.isfinite(hypergradient).all():
             raise RuntimeError("bilevel hypergradient is nonfinite")
         clip = float(args.bilevel_angle_gradient_clip)
@@ -460,18 +485,44 @@ def bilevel_angle_step(
     finally:
         model.train(was_training)
 
-    gap_after = float(
-        torch.rad2deg(learner.confusion_gap()).detach().cpu().item()
+    gaps_after = torch.rad2deg(
+        learner.normalized_gaps()
+    ).detach()
+    representative_gap_after = float(
+        (
+            gaps_after[0]
+            if model.experiment_mode in BILEVEL_SHARED_GAP_MODES
+            else gaps_after.min()
+        ).cpu().item()
+    )
+    hypergradient_norm = float(
+        torch.linalg.vector_norm(hypergradient.detach()).cpu().item()
+    )
+    gap_change = float(
+        torch.linalg.vector_norm(gaps_after - gaps_before)
+        .cpu()
+        .item()
     )
     return {
         "bilevel_outer_classification_loss": float(
             outer_loss.detach().cpu().item()
         ),
-        "bilevel_hypergradient": float(
-            hypergradient.detach().cpu().item()
+        "bilevel_gap_prior_regularization": float(
+            gap_prior_regularization.detach().cpu().item()
         ),
-        "bilevel_gap_before_degrees": gap_before,
-        "bilevel_gap_after_degrees": gap_after,
+        "bilevel_hypergradient": float(
+            (
+                hypergradient.detach().reshape(-1)[0]
+                if hypergradient.numel() == 1
+                else torch.linalg.vector_norm(hypergradient.detach())
+            )
+            .cpu()
+            .item()
+        ),
+        "bilevel_hypergradient_norm": hypergradient_norm,
+        "bilevel_gap_before_degrees": representative_gap_before,
+        "bilevel_gap_after_degrees": representative_gap_after,
+        "bilevel_gap_change_l2_degrees": gap_change,
         "bilevel_updates": 1.0,
     }
 
@@ -970,8 +1021,29 @@ def experiment_directory_name(
     bilevel_gap_initial_degrees=90.0,
     bilevel_angle_learning_rate=0.001,
     bilevel_outer_confusion_weight=0.1,
+    bilevel_all_gaps_initialization="equal",
+    bilevel_minimum_class_gap_degrees=20.0,
+    bilevel_gap_prior_weight=0.01,
 ):
-    if mode in BILEVEL_ANGLE_MODES:
+    if mode in BILEVEL_ALL_GAP_MODES:
+        condition = (
+            "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
+            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+        ).format(
+            mode,
+            format(float(circular_weight), "g"),
+            bilevel_all_gaps_initialization,
+            format(
+                float(bilevel_minimum_class_gap_degrees), "g"
+            ),
+            format(float(bilevel_gap_prior_weight), "g"),
+            format(float(confused_cse_pair_weight), "g"),
+            format(float(confusion_classification_margin), "g"),
+            format(float(confusion_classification_weight), "g"),
+            format(float(bilevel_angle_learning_rate), "g"),
+            format(float(bilevel_outer_confusion_weight), "g"),
+        )
+    elif mode in BILEVEL_SHARED_GAP_MODES:
         condition = (
             "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
             "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
@@ -1214,6 +1286,62 @@ def bilevel_gap_payload(model, args):
     gaps = torch.rad2deg(
         learner.normalized_gaps().detach().cpu()
     ).tolist()
+    order = learner.circle_order.detach().cpu().tolist()
+    named_gaps = {}
+    for position, class_id in enumerate(order):
+        next_class_id = order[(position + 1) % len(order)]
+        named_gaps[
+            "{}_to_{}".format(
+                ID2EMOTION[int(class_id)],
+                ID2EMOTION[int(next_class_id)],
+            )
+        ] = float(gaps[position])
+    common = {
+        "normalized_gaps_degrees": [
+            float(value) for value in gaps
+        ],
+        "named_gaps_degrees": named_gaps,
+        "angle_learning_rate": float(
+            args.bilevel_angle_learning_rate
+        ),
+        "inner_step_size": float(args.bilevel_inner_step_size),
+        "hvp_radius": float(args.bilevel_hvp_radius),
+        "outer_confusion_weight": float(
+            args.bilevel_outer_confusion_weight
+        ),
+        "angle_gradient_clip": float(
+            args.bilevel_angle_gradient_clip
+        ),
+    }
+    if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
+        prior_penalty = float(
+            learner.gap_prior_regularization()
+            .detach()
+            .cpu()
+            .item()
+        )
+        return {
+            "parameterization": (
+                "minimum_floor_plus_softmax_all_gap_allocation"
+            ),
+            "initialization": (
+                args.bilevel_all_gaps_initialization
+            ),
+            "minimum_class_gap_degrees": float(
+                args.bilevel_minimum_class_gap_degrees
+            ),
+            "gap_prior_weight": float(
+                args.bilevel_gap_prior_weight
+            ),
+            "gap_prior_regularization": prior_penalty,
+            "selected_minimum_gap_degrees": float(min(gaps)),
+            "selected_maximum_gap_degrees": float(max(gaps)),
+            "raw_parameters": [
+                float(value)
+                for value in learner.raw_gaps.detach().cpu().tolist()
+            ],
+            **common,
+        }
     return {
         "parameterization": (
             "shared_confusion_gap_with_balanced_remaining_gaps"
@@ -1233,17 +1361,7 @@ def bilevel_gap_payload(model, args):
         "raw_parameter": float(
             learner.raw_gaps.detach().cpu().item()
         ),
-        "angle_learning_rate": float(
-            args.bilevel_angle_learning_rate
-        ),
-        "inner_step_size": float(args.bilevel_inner_step_size),
-        "hvp_radius": float(args.bilevel_hvp_radius),
-        "outer_confusion_weight": float(
-            args.bilevel_outer_confusion_weight
-        ),
-        "angle_gradient_clip": float(
-            args.bilevel_angle_gradient_clip
-        ),
+        **common,
     }
 
 
@@ -1330,7 +1448,7 @@ def build_bilevel_angle_optimizer(model, learning_rate):
     parameters = tuple(model.circular_angle_learner.parameters())
     if len(parameters) != 1:
         raise ValueError(
-            "bilevel shared-gap mode requires one angle parameter"
+            "bilevel mode requires one raw-gap parameter tensor"
         )
     return optim.Adam(
         parameters,
@@ -1404,6 +1522,15 @@ def save_checkpoint(
         ),
         "bilevel_gap_initial_degrees": (
             args.bilevel_gap_initial_degrees
+        ),
+        "bilevel_all_gaps_initialization": (
+            args.bilevel_all_gaps_initialization
+        ),
+        "bilevel_minimum_class_gap_degrees": (
+            args.bilevel_minimum_class_gap_degrees
+        ),
+        "bilevel_gap_prior_weight": (
+            args.bilevel_gap_prior_weight
         ),
         "bilevel_angle_learning_rate": (
             args.bilevel_angle_learning_rate
@@ -1517,6 +1644,7 @@ def validate_arguments(args):
         "same_class_margin",
         "bilevel_outer_confusion_weight",
         "bilevel_angle_gradient_clip",
+        "bilevel_gap_prior_weight",
     ):
         if getattr(args, name) < 0:
             raise ValueError("--{} must be nonnegative".format(
@@ -1559,6 +1687,15 @@ def validate_arguments(args):
             "< maximum < 180"
         )
     if (
+        not np.isfinite(args.bilevel_minimum_class_gap_degrees)
+        or args.bilevel_minimum_class_gap_degrees < 0.0
+        or args.bilevel_minimum_class_gap_degrees >= 60.0
+    ):
+        raise ValueError(
+            "--bilevel-minimum-class-gap-degrees must be finite "
+            "and in [0, 60)"
+        )
+    if (
         not np.isfinite(args.minimum_confusion_gap_degrees)
         or args.minimum_confusion_gap_degrees <= 0.0
         or args.minimum_confusion_gap_degrees > 180.0
@@ -1588,7 +1725,11 @@ def validate_arguments(args):
     if not np.isfinite(args.vad_center_arousal):
         raise ValueError("--vad-center-arousal must be finite")
     if args.circular_geometry is None:
-        if args.experiment_mode in CONFUSION_MARGIN_MODES:
+        if args.experiment_mode in BILEVEL_ALL_GAP_MODES:
+            args.circular_geometry = (
+                args.bilevel_all_gaps_initialization
+            )
+        elif args.experiment_mode in CONFUSION_MARGIN_MODES:
             args.circular_geometry = "confusion_separated"
         elif args.experiment_mode in CONFUSION_GAP_MODES:
             args.circular_geometry = "equal"
@@ -1605,6 +1746,7 @@ def validate_arguments(args):
         )
     if (
         args.experiment_mode in CONFUSION_MARGIN_MODES
+        and args.experiment_mode not in BILEVEL_ALL_GAP_MODES
         and args.circular_geometry != "confusion_separated"
     ):
         raise ValueError(
@@ -1613,6 +1755,7 @@ def validate_arguments(args):
         )
     if (
         args.experiment_mode in CONFUSION_MARGIN_MODES
+        and args.experiment_mode not in BILEVEL_ALL_GAP_MODES
         and args.minimum_confusion_gap_degrees >= 180.0
     ):
         raise ValueError(
@@ -1630,13 +1773,23 @@ def validate_arguments(args):
                 "bilevel confusion-gap mode requires positive "
                 "--circular-weight"
             )
-        args.minimum_confusion_gap_degrees = (
-            args.bilevel_gap_minimum_degrees
+        if args.experiment_mode in BILEVEL_SHARED_GAP_MODES:
+            args.minimum_confusion_gap_degrees = (
+                args.bilevel_gap_minimum_degrees
+            )
+    if (
+        args.experiment_mode in BILEVEL_ALL_GAP_MODES
+        and args.circular_geometry
+        != args.bilevel_all_gaps_initialization
+    ):
+        raise ValueError(
+            "all-gap initialization must match --circular-geometry "
+            "when both are specified"
         )
     if args.experiment_mode not in CIRCULAR_CSE_MODES:
         args.circular_weight = 0.0
         args.circular_geometry = "equal"
-    build_iemocap_angles(
+    validated_initial_angles = build_iemocap_angles(
         geometry=args.circular_geometry,
         vad_center=(
             args.vad_center_valence,
@@ -1646,6 +1799,15 @@ def validate_arguments(args):
             args.minimum_confusion_gap_degrees
         ),
     )
+    if args.experiment_mode in BILEVEL_ALL_GAP_MODES:
+        BilevelAllGapsAngles(
+            num_classes=6,
+            minimum_gap_degrees=(
+                args.bilevel_minimum_class_gap_degrees
+            ),
+            prior_angles=validated_initial_angles,
+            circle_order=CIRCLE_ORDER,
+        )
     if args.experiment_mode in FUSION_ONLY_MODES:
         args.unimodal_ce_weight = 0.0
         args.distillation_weight = 0.0
@@ -1692,6 +1854,9 @@ def train_and_test(args):
             args.bilevel_gap_initial_degrees,
             args.bilevel_angle_learning_rate,
             args.bilevel_outer_confusion_weight,
+            args.bilevel_all_gaps_initialization,
+            args.bilevel_minimum_class_gap_degrees,
+            args.bilevel_gap_prior_weight,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1741,6 +1906,9 @@ def train_and_test(args):
         ),
         bilevel_gap_initial_degrees=(
             args.bilevel_gap_initial_degrees
+        ),
+        bilevel_minimum_class_gap_degrees=(
+            args.bilevel_minimum_class_gap_degrees
         ),
         sdt_residual_update=args.sdt_residual_update,
         spherical_attention_alpha_init=(
@@ -1875,10 +2043,21 @@ def train_and_test(args):
                 angle_history_rows,
             )
         if args.experiment_mode in BILEVEL_ANGLE_MODES:
+            current_bilevel_geometry = bilevel_gap_payload(
+                model, args
+            )
             bilevel_row = {
                 "epoch": epoch,
-                **bilevel_gap_payload(model, args),
+                **current_bilevel_geometry,
             }
+            for gap_name, gap_value in (
+                current_bilevel_geometry.get(
+                    "named_gaps_degrees", {}
+                ).items()
+            ):
+                bilevel_row[
+                    "gap_{}_degrees".format(gap_name)
+                ] = gap_value
             for name in BILEVEL_METRIC_NAMES:
                 bilevel_row[name] = training.get(name)
             bilevel_history_rows.append(bilevel_row)
@@ -2369,6 +2548,33 @@ def build_argument_parser():
         help="initial validation-learned shared gap",
     )
     parser.add_argument(
+        "--bilevel-all-gaps-initialization",
+        choices=("equal", "nrc_vad"),
+        default="equal",
+        help=(
+            "fixed geometry used to initialize the six independently "
+            "validation-learned gaps"
+        ),
+    )
+    parser.add_argument(
+        "--bilevel-minimum-class-gap-degrees",
+        type=float,
+        default=20.0,
+        help=(
+            "hard lower bound for every independently learned "
+            "consecutive class gap"
+        ),
+    )
+    parser.add_argument(
+        "--bilevel-gap-prior-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "outer-objective weight for squared deviation from the "
+            "six initialization gaps"
+        ),
+    )
+    parser.add_argument(
         "--bilevel-angle-learning-rate",
         type=float,
         default=0.001,
@@ -2402,7 +2608,10 @@ def build_argument_parser():
         "--bilevel-angle-gradient-clip",
         type=float,
         default=5.0,
-        help="absolute clipping bound for the scalar hypergradient; 0 disables",
+        help=(
+            "elementwise absolute clipping bound for gap "
+            "hypergradients; 0 disables"
+        ),
     )
     parser.add_argument(
         "--same-class-margin", type=float, default=0.0
