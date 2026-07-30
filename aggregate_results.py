@@ -20,6 +20,7 @@ METRICS = (
     "unimodal_circular_cse",
     "total_circular_cse",
     "angle_regularization",
+    "gap_prior_regularization",
     "confusion_gap_regularization",
     "confusion_classification_margin",
     "happy_excited_pair_macro_f1",
@@ -58,7 +59,7 @@ def condition_name(summary):
         geometry = summary.get("bilevel_geometry") or {}
         condition = (
             "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+            "clsmargin_{}_clsweight_{}"
         ).format(
             mode,
             format(float(summary["circular_weight"]), "g"),
@@ -95,15 +96,32 @@ def condition_name(summary):
                 ),
                 "g",
             ),
-            format(
-                float(geometry.get("angle_learning_rate", 0.001)),
-                "g",
-            ),
-            format(
-                float(geometry.get("outer_confusion_weight", 0.1)),
-                "g",
-            ),
         )
+        learning_source = geometry.get(
+            "learning_source",
+            summary.get("all_gap_learning_source", "validation"),
+        )
+        if learning_source == "validation":
+            condition += "_anglelr_{}_outerconf_{}".format(
+                format(
+                    float(
+                        geometry.get(
+                            "angle_learning_rate", 0.001
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "outer_confusion_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+            )
+        else:
+            condition += "_source_{}".format(learning_source)
     elif mode == "sdt_cse_bilevel_confusion_gap":
         geometry = summary.get("bilevel_geometry") or {}
         condition = (

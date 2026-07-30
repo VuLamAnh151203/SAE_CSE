@@ -81,6 +81,7 @@ LOSS_NAMES = (
     "unimodal_circular_cse",
     "total_circular_cse",
     "angle_regularization",
+    "gap_prior_regularization",
     "confusion_gap_regularization",
     "confusion_classification_margin",
 )
@@ -107,6 +108,18 @@ BILEVEL_METRIC_NAMES = (
     "bilevel_gap_change_l2_degrees",
     "bilevel_updates",
 )
+
+
+def uses_validation_gap_learning(args):
+    if args.experiment_mode in BILEVEL_SHARED_GAP_MODES:
+        return True
+    return (
+        args.experiment_mode in BILEVEL_ALL_GAP_MODES
+        and getattr(
+            args, "all_gap_learning_source", "validation"
+        )
+        == "validation"
+    )
 
 
 def set_random_seed(seed, use_cuda):
@@ -303,6 +316,20 @@ def _compute_batch_losses(
             args.confusion_classification_margin
         ),
     )
+    gap_prior_regularization = outputs["fusion_logits"].sum() * 0.0
+    if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
+        gap_prior_regularization = (
+            model.circular_angle_learner.gap_prior_regularization()
+        )
+        if args.all_gap_learning_source == "training":
+            losses["total_loss"] = (
+                losses["total_loss"]
+                + args.bilevel_gap_prior_weight
+                * gap_prior_regularization
+            )
+    losses["gap_prior_regularization"] = (
+        gap_prior_regularization
+    )
     return outputs, losses
 
 
@@ -343,6 +370,10 @@ def bilevel_angle_step(
     if model.experiment_mode not in BILEVEL_ANGLE_MODES:
         raise ValueError(
             "bilevel_angle_step requires a bilevel experiment mode"
+        )
+    if not uses_validation_gap_learning(args):
+        raise ValueError(
+            "bilevel_angle_step requires validation gap learning"
         )
     learner = model.circular_angle_learner
     if learner is None:
@@ -1024,11 +1055,12 @@ def experiment_directory_name(
     bilevel_all_gaps_initialization="equal",
     bilevel_minimum_class_gap_degrees=20.0,
     bilevel_gap_prior_weight=0.01,
+    all_gap_learning_source="validation",
 ):
     if mode in BILEVEL_ALL_GAP_MODES:
         condition = (
             "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+            "clsmargin_{}_clsweight_{}"
         ).format(
             mode,
             format(float(circular_weight), "g"),
@@ -1040,9 +1072,16 @@ def experiment_directory_name(
             format(float(confused_cse_pair_weight), "g"),
             format(float(confusion_classification_margin), "g"),
             format(float(confusion_classification_weight), "g"),
-            format(float(bilevel_angle_learning_rate), "g"),
-            format(float(bilevel_outer_confusion_weight), "g"),
         )
+        if all_gap_learning_source == "validation":
+            condition += "_anglelr_{}_outerconf_{}".format(
+                format(float(bilevel_angle_learning_rate), "g"),
+                format(float(bilevel_outer_confusion_weight), "g"),
+            )
+        else:
+            condition += "_source_{}".format(
+                all_gap_learning_source
+            )
     elif mode in BILEVEL_SHARED_GAP_MODES:
         condition = (
             "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
@@ -1301,17 +1340,6 @@ def bilevel_gap_payload(model, args):
             float(value) for value in gaps
         ],
         "named_gaps_degrees": named_gaps,
-        "angle_learning_rate": float(
-            args.bilevel_angle_learning_rate
-        ),
-        "inner_step_size": float(args.bilevel_inner_step_size),
-        "hvp_radius": float(args.bilevel_hvp_radius),
-        "outer_confusion_weight": float(
-            args.bilevel_outer_confusion_weight
-        ),
-        "angle_gradient_clip": float(
-            args.bilevel_angle_gradient_clip
-        ),
     }
     if model.experiment_mode in BILEVEL_ALL_GAP_MODES:
         prior_penalty = float(
@@ -1320,10 +1348,37 @@ def bilevel_gap_payload(model, args):
             .cpu()
             .item()
         )
+        if args.all_gap_learning_source == "training":
+            optimization = {
+                "optimizer": "main_adam_zero_weight_decay",
+                "angle_learning_rate": float(args.lr),
+                "inner_step_size": None,
+                "hvp_radius": None,
+                "outer_confusion_weight": None,
+                "angle_gradient_clip": None,
+            }
+        else:
+            optimization = {
+                "optimizer": "separate_outer_adam_zero_weight_decay",
+                "angle_learning_rate": float(
+                    args.bilevel_angle_learning_rate
+                ),
+                "inner_step_size": float(
+                    args.bilevel_inner_step_size
+                ),
+                "hvp_radius": float(args.bilevel_hvp_radius),
+                "outer_confusion_weight": float(
+                    args.bilevel_outer_confusion_weight
+                ),
+                "angle_gradient_clip": float(
+                    args.bilevel_angle_gradient_clip
+                ),
+            }
         return {
             "parameterization": (
                 "minimum_floor_plus_softmax_all_gap_allocation"
             ),
+            "learning_source": args.all_gap_learning_source,
             "initialization": (
                 args.bilevel_all_gaps_initialization
             ),
@@ -1341,7 +1396,22 @@ def bilevel_gap_payload(model, args):
                 for value in learner.raw_gaps.detach().cpu().tolist()
             ],
             **common,
+            **optimization,
         }
+    optimization = {
+        "optimizer": "separate_outer_adam_zero_weight_decay",
+        "angle_learning_rate": float(
+            args.bilevel_angle_learning_rate
+        ),
+        "inner_step_size": float(args.bilevel_inner_step_size),
+        "hvp_radius": float(args.bilevel_hvp_radius),
+        "outer_confusion_weight": float(
+            args.bilevel_outer_confusion_weight
+        ),
+        "angle_gradient_clip": float(
+            args.bilevel_angle_gradient_clip
+        ),
+    }
     return {
         "parameterization": (
             "shared_confusion_gap_with_balanced_remaining_gaps"
@@ -1362,6 +1432,7 @@ def bilevel_gap_payload(model, args):
             learner.raw_gaps.detach().cpu().item()
         ),
         **common,
+        **optimization,
     }
 
 
@@ -1532,6 +1603,9 @@ def save_checkpoint(
         "bilevel_gap_prior_weight": (
             args.bilevel_gap_prior_weight
         ),
+        "all_gap_learning_source": (
+            args.all_gap_learning_source
+        ),
         "bilevel_angle_learning_rate": (
             args.bilevel_angle_learning_rate
         ),
@@ -1610,6 +1684,14 @@ def validate_arguments(args):
         raise ValueError("--temperature must be positive")
     if args.embedding_dim < 2:
         raise ValueError("--embedding-dim must be at least 2")
+    if (
+        args.experiment_mode not in BILEVEL_ALL_GAP_MODES
+        and args.all_gap_learning_source != "validation"
+    ):
+        raise ValueError(
+            "--all-gap-learning-source applies only to "
+            "sdt_cse_bilevel_all_gaps"
+        )
     if args.selection_protocol not in SELECTION_PROTOCOLS:
         raise ValueError(
             "--selection-protocol must be one of {}".format(
@@ -1763,10 +1845,15 @@ def validate_arguments(args):
             "--minimum-confusion-gap-degrees below 180"
         )
     if args.experiment_mode in BILEVEL_ANGLE_MODES:
-        if args.selection_protocol != "validation":
+        if (
+            uses_validation_gap_learning(args)
+            and args.selection_protocol != "validation"
+        ):
             raise ValueError(
-                "bilevel confusion-gap mode requires "
-                "--selection-protocol validation"
+                "validation-learned gap mode requires "
+                "--selection-protocol validation; use "
+                "--all-gap-learning-source training for training-only "
+                "gap updates"
             )
         if args.circular_weight <= 0.0:
             raise ValueError(
@@ -1857,6 +1944,7 @@ def train_and_test(args):
             args.bilevel_all_gaps_initialization,
             args.bilevel_minimum_class_gap_degrees,
             args.bilevel_gap_prior_weight,
+            args.all_gap_learning_source,
         ),
         "seed_{}".format(args.seed),
     )
@@ -1959,17 +2047,20 @@ def train_and_test(args):
         if args.experiment_mode in CIRCULAR_CSE_MODES
         else None
     )
+    validation_gap_learning = uses_validation_gap_learning(args)
     optimizer = build_optimizer(
         model,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        exclude_angle_parameters=(
-            args.experiment_mode in BILEVEL_ANGLE_MODES
-        ),
+        exclude_angle_parameters=validation_gap_learning,
     )
-    angle_optimizer = build_bilevel_angle_optimizer(
-        model,
-        learning_rate=args.bilevel_angle_learning_rate,
+    angle_optimizer = (
+        build_bilevel_angle_optimizer(
+            model,
+            learning_rate=args.bilevel_angle_learning_rate,
+        )
+        if validation_gap_learning
+        else None
     )
 
     best_path = os.path.join(run_dir, "best_checkpoint.pt")
@@ -1989,7 +2080,7 @@ def train_and_test(args):
     selection_loader = loaders[selection_name]
     bilevel_validation_batches = (
         cycle_batches(loaders["validation"])
-        if args.experiment_mode in BILEVEL_ANGLE_MODES
+        if validation_gap_learning
         else None
     )
 
@@ -2121,7 +2212,7 @@ def train_and_test(args):
                         name: training.get(name)
                         for name in BILEVEL_METRIC_NAMES
                     }
-                    if args.experiment_mode in BILEVEL_ANGLE_MODES
+                    if validation_gap_learning
                     else None
                 ),
             )
@@ -2366,6 +2457,9 @@ def train_and_test(args):
         "selection_metrics": best_selection,
         "seed": args.seed,
         "circular_weight": args.circular_weight,
+        "all_gap_learning_source": (
+            args.all_gap_learning_source
+        ),
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
         "confused_cse_pair_weight": args.confused_cse_pair_weight,
@@ -2553,7 +2647,17 @@ def build_argument_parser():
         default="equal",
         help=(
             "fixed geometry used to initialize the six independently "
-            "validation-learned gaps"
+            "learned hard-floor gaps"
+        ),
+    )
+    parser.add_argument(
+        "--all-gap-learning-source",
+        choices=("validation", "training"),
+        default="validation",
+        help=(
+            "validation uses bilevel hypergradients; training puts "
+            "the same six hard-floor gap parameters in the ordinary "
+            "training optimizer"
         ),
     )
     parser.add_argument(

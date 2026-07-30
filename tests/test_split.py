@@ -206,6 +206,25 @@ class FixedSplitTest(unittest.TestCase):
         )
         self.assertEqual(
             experiment_directory_name(
+                "sdt_cse_bilevel_all_gaps",
+                0.1,
+                "equal",
+                confused_cse_pair_weight=5.0,
+                confusion_classification_margin=0.1,
+                confusion_classification_weight=0.1,
+                bilevel_all_gaps_initialization="equal",
+                bilevel_minimum_class_gap_degrees=20.0,
+                bilevel_gap_prior_weight=0.01,
+                all_gap_learning_source="training",
+            ),
+            (
+                "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
+                "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_source_training"
+            ),
+        )
+        self.assertEqual(
+            experiment_directory_name(
                 "sdt_cse",
                 0.1,
                 "equal",
@@ -335,6 +354,9 @@ class FixedSplitTest(unittest.TestCase):
         self.assertEqual(
             all_gaps.confusion_classification_weight, 0.1
         )
+        self.assertEqual(
+            all_gaps.all_gap_learning_source, "validation"
+        )
 
         nrc_all_gaps = parser.parse_args(
             [
@@ -370,6 +392,35 @@ class FixedSplitTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_arguments(invalid_all_gaps)
+
+        training_all_gaps = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--all-gap-learning-source",
+                "training",
+                "--selection-protocol",
+                "test",
+            ]
+        )
+        validate_arguments(training_all_gaps)
+        self.assertEqual(
+            training_all_gaps.all_gap_learning_source, "training"
+        )
+        self.assertEqual(
+            training_all_gaps.selection_protocol, "test"
+        )
+
+        invalid_source_mode = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt",
+                "--all-gap-learning-source",
+                "training",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_source_mode)
 
         fixed = parser.parse_args(
             ["--experiment-mode", "sdt_cse"]
@@ -487,6 +538,19 @@ class FixedSplitTest(unittest.TestCase):
                 "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
                 "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
                 "clsweight_0.1_anglelr_0.001_outerconf_0.1"
+            ),
+        )
+        training_all_gaps = dict(all_gaps)
+        training_all_gaps["bilevel_geometry"] = dict(
+            all_gaps["bilevel_geometry"],
+            learning_source="training",
+        )
+        self.assertEqual(
+            condition_name(training_all_gaps),
+            (
+                "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
+                "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
+                "clsweight_0.1_source_training"
             ),
         )
 

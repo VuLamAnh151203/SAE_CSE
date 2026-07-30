@@ -35,6 +35,7 @@ from model import (  # noqa: E402
     TransformerEncoder,
 )
 from train import (  # noqa: E402
+    _compute_batch_losses,
     angle_history_row,
     bilevel_angle_step,
     build_argument_parser,
@@ -42,6 +43,7 @@ from train import (  # noqa: E402
     build_optimizer,
     save_checkpoint,
     spherical_residual_history_row,
+    uses_validation_gap_learning,
     validate_arguments,
 )
 
@@ -1230,6 +1232,114 @@ class BilevelAllGapsTest(unittest.TestCase):
                 model.circular_angle_learner.raw_gaps,
             )
         )
+
+    def test_training_source_updates_same_hard_floor_gaps_without_validation(self):
+        torch.manual_seed(211)
+        model = make_model("sdt_cse_bilevel_all_gaps")
+        with torch.no_grad():
+            model.circular_angle_learner.raw_gaps.copy_(
+                torch.tensor([0.4, -0.3, 0.2, -0.1, 0.1, -0.2])
+            )
+        inputs = make_inputs()
+        batch = {
+            "text": inputs[0],
+            "visual": inputs[1],
+            "audio": inputs[2],
+            "utterance_mask": inputs[3],
+            "speaker_mask": inputs[4].permute(1, 0, 2),
+            "labels": torch.tensor(
+                [[0, 4, 3, 5], [1, 2, 0, 0]]
+            ),
+        }
+        parser = build_argument_parser()
+        args = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--all-gap-learning-source",
+                "training",
+                "--bilevel-gap-prior-weight",
+                "1",
+            ]
+        )
+        validate_arguments(args)
+        self.assertFalse(uses_validation_gap_learning(args))
+        criterion = CircularCSELoss(
+            class_angles=build_iemocap_angles(geometry="equal"),
+            confusion_pair_weight=5.0,
+        )
+        optimizer = build_optimizer(
+            model,
+            1e-3,
+            1e-5,
+            exclude_angle_parameters=uses_validation_gap_learning(
+                args
+            ),
+        )
+        raw = model.circular_angle_learner.raw_gaps
+        optimizer_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        self.assertIn(id(raw), optimizer_ids)
+        raw_before = raw.detach().clone()
+
+        optimizer.zero_grad()
+        _, training_losses = _compute_batch_losses(
+            model,
+            batch,
+            iemocap_class_weights(),
+            criterion,
+            args,
+        )
+        self.assertGreater(
+            float(
+                training_losses["gap_prior_regularization"]
+                .detach()
+                .item()
+            ),
+            0.0,
+        )
+        validation_args = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps",
+                "--all-gap-learning-source",
+                "validation",
+                "--bilevel-gap-prior-weight",
+                "1",
+            ]
+        )
+        validate_arguments(validation_args)
+        _, validation_losses = _compute_batch_losses(
+            model,
+            batch,
+            iemocap_class_weights(),
+            criterion,
+            validation_args,
+        )
+        added_prior = (
+            training_losses["total_loss"]
+            - validation_losses["total_loss"]
+        )
+        self.assertTrue(
+            torch.allclose(
+                added_prior,
+                training_losses["gap_prior_regularization"],
+                atol=1e-6,
+            )
+        )
+        training_losses["total_loss"].backward()
+        self.assertIsNotNone(raw.grad)
+        self.assertGreater(float(raw.grad.abs().sum()), 0.0)
+        optimizer.step()
+        self.assertFalse(torch.allclose(raw_before, raw.detach()))
+        gaps = torch.rad2deg(
+            model.circular_angle_learner.normalized_gaps().detach()
+        )
+        self.assertTrue(torch.all(gaps > 20.0))
+        self.assertAlmostEqual(float(gaps.sum()), 360.0, places=4)
 
 
 class LearnableCircularAnglesTest(unittest.TestCase):

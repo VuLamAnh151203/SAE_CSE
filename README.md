@@ -20,7 +20,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 | `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
-| `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | All six ordered gaps learned from validation classification |
+| `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | Six hard-floor ordered gaps learned from validation or training |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -306,6 +306,22 @@ the confused-pair cosine margin; validation weighted F1 remains the
 checkpoint-selection metric. The squared prior penalty is computed in
 radians internally.
 
+Select where the six gap parameters receive gradients with:
+
+```text
+--all-gap-learning-source {validation,training}
+```
+
+`validation` is the default bilevel method. `training` keeps the identical
+hard-floor parameterization, initialization, weighted confused-pair
+CircularCSE, direct confusion-classification margin, and gap prior, but puts
+the raw gaps in the ordinary training Adam optimizer with zero weight decay.
+In training-source mode no validation minibatch or hypergradient is used;
+validation only selects the checkpoint. The gaps use the normal `--lr`;
+`--bilevel-angle-learning-rate`, `--bilevel-inner-step-size`,
+`--bilevel-hvp-radius`, `--bilevel-outer-confusion-weight`, and
+`--bilevel-angle-gradient-clip` are inactive.
+
 NRC-VAD initialization is also available with
 `--bilevel-all-gaps-initialization nrc_vad`, but its smallest prior gap is
 about 19.8 degrees. Therefore, set
@@ -525,6 +541,7 @@ python train.py \
 python train.py \
   --experiment-mode sdt_cse_bilevel_all_gaps \
   --selection-protocol validation \
+  --all-gap-learning-source validation \
   --circular-weight 0.1 \
   --confused-cse-pair-weight 5 \
   --confusion-classification-margin 0.1 \
@@ -536,6 +553,25 @@ python train.py \
   --bilevel-inner-step-size 0.0001 \
   --bilevel-hvp-radius 0.01 \
   --bilevel-outer-confusion-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+```
+
+Run the same six-gap model while learning gaps only from training:
+
+```bash
+python train.py \
+  --experiment-mode sdt_cse_bilevel_all_gaps \
+  --selection-protocol validation \
+  --all-gap-learning-source training \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-all-gaps-initialization equal \
+  --bilevel-minimum-class-gap-degrees 20 \
+  --bilevel-gap-prior-weight 0.01 \
   --device cuda \
   --gpu-id 0 \
   --seed 2024
@@ -640,6 +676,14 @@ It starts from six equal 60-degree gaps, enforces a 20-degree minimum for
 each gap, and records all six learned values in `angle_history.csv`,
 `bilevel_gap_history.csv`, checkpoints, per-seed summaries, and aggregate
 CSV files.
+
+The launcher defaults to validation gap learning. Run the training-only
+counterpart with:
+
+```bash
+GPU_ID=0 GAP_LEARNING_SOURCE=training \
+  bash exec_iemocap_bilevel_all_gaps.sh
+```
 
 Run all experiment modes over ten initialization seeds and aggregate them:
 

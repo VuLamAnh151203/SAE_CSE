@@ -4,10 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}/results"
 GPU_ID="${GPU_ID:-0}"
+GAP_LEARNING_SOURCE="${GAP_LEARNING_SOURCE:-validation}"
 
 for seed in $(seq 2024 2033)
 do
-  echo "mode=sdt_cse_bilevel_all_gaps init=equal minimum_gap=20 seed=${seed}"
+  echo "mode=sdt_cse_bilevel_all_gaps source=${GAP_LEARNING_SOURCE} init=equal minimum_gap=20 seed=${seed}"
   python -u "${SCRIPT_DIR}/train.py" \
     --experiment-mode sdt_cse_bilevel_all_gaps \
     --selection-protocol validation \
@@ -16,6 +17,7 @@ do
     --confusion-classification-margin 0.1 \
     --confusion-classification-weight 0.1 \
     --bilevel-all-gaps-initialization equal \
+    --all-gap-learning-source "${GAP_LEARNING_SOURCE}" \
     --bilevel-minimum-class-gap-degrees 20 \
     --bilevel-gap-prior-weight 0.01 \
     --bilevel-angle-learning-rate 0.001 \
