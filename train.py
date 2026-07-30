@@ -32,6 +32,7 @@ from losses import (
     HypoPrototypeLoss,
     ID2EMOTION,
     IEMOCAP_CONFUSION_PAIRS,
+    IEMOCAP_THREE_CONFUSION_GAP_PAIRS,
     build_iemocap_angles,
     build_iemocap_vad_anchors,
     build_target_similarity,
@@ -60,6 +61,8 @@ from model import (
     SDT_RESIDUAL_UPDATES,
     SDTCSEModel,
     STABILIZED_HYPO_MODES,
+    THREE_PAIR_CONFUSION_GAP_MODES,
+    TRAIN_HOLDOUT_BILEVEL_MODES,
 )
 
 
@@ -97,6 +100,7 @@ LOSS_NAMES = (
 CONFUSION_PAIR_NAMES = (
     ("happy_excited", 0, 4),
     ("angry_frustrated", 3, 5),
+    ("sad_neutral", 1, 2),
 )
 CONFUSION_PAIR_METRIC_NAMES = tuple(
     "{}_{}".format(pair_name, suffix)
@@ -174,6 +178,8 @@ def hypo_schedule_scale(
 
 
 def uses_validation_gap_learning(args):
+    if args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES:
+        return False
     if args.experiment_mode in BILEVEL_SHARED_GAP_MODES:
         return True
     return (
@@ -183,6 +189,27 @@ def uses_validation_gap_learning(args):
         )
         == "validation"
     )
+
+
+def uses_bilevel_gap_learning(args):
+    return (
+        uses_validation_gap_learning(args)
+        or args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES
+    )
+
+
+def bilevel_outer_split_name(args):
+    if args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES:
+        return "angle_holdout"
+    if uses_validation_gap_learning(args):
+        return "validation"
+    return None
+
+
+def confusion_gap_pairs_for_mode(experiment_mode):
+    if experiment_mode in THREE_PAIR_CONFUSION_GAP_MODES:
+        return IEMOCAP_THREE_CONFUSION_GAP_PAIRS
+    return IEMOCAP_CONFUSION_PAIRS
 
 
 def set_random_seed(seed, use_cuda):
@@ -241,7 +268,7 @@ def cycle_batches(dataloader):
             yield batch
         if not produced:
             raise RuntimeError(
-                "cannot cycle an empty validation dataloader"
+                "cannot cycle an empty bilevel outer dataloader"
             )
 
 
@@ -380,6 +407,9 @@ def _compute_batch_losses(
         minimum_confusion_gap_degrees=(
             args.minimum_confusion_gap_degrees
         ),
+        confusion_gap_pairs=confusion_gap_pairs_for_mode(
+            model.experiment_mode
+        ),
         confusion_classification_weight=(
             args.confusion_classification_weight
         ),
@@ -447,21 +477,21 @@ def _bilevel_outer_classification_loss(
 def bilevel_angle_step(
     model,
     training_batch,
-    validation_batch,
+    outer_batch,
     class_weights,
     circular_loss_function,
     args,
     angle_optimizer,
     hypo_loss_function=None,
 ):
-    """Approximate a one-step validation hypergradient with DARTS HVP."""
+    """Approximate a one-step held-out hypergradient with DARTS HVP."""
     if model.experiment_mode not in BILEVEL_ANGLE_MODES:
         raise ValueError(
             "bilevel_angle_step requires a bilevel experiment mode"
         )
-    if not uses_validation_gap_learning(args):
+    if not uses_bilevel_gap_learning(args):
         raise ValueError(
-            "bilevel_angle_step requires validation gap learning"
+            "bilevel_angle_step requires held-out gap learning"
         )
     learner = model.circular_angle_learner
     if learner is None:
@@ -495,22 +525,22 @@ def bilevel_angle_step(
     )
     gap_prior_regularization = angle_parameter.new_zeros(())
     try:
-        validation_outputs = _model_forward(
-            model, validation_batch
+        outer_outputs = _model_forward(
+            model, outer_batch
         )
         outer_loss = _bilevel_outer_classification_loss(
-            validation_outputs,
-            validation_batch,
+            outer_outputs,
+            outer_batch,
             class_weights,
             args,
         )
-        validation_vector = torch.autograd.grad(
+        outer_vector = torch.autograd.grad(
             outer_loss,
             weight_parameters,
             allow_unused=True,
         )
         vector_norm_squared = outer_loss.new_zeros(())
-        for gradient in validation_vector:
+        for gradient in outer_vector:
             if gradient is not None:
                 vector_norm_squared = (
                     vector_norm_squared
@@ -522,7 +552,7 @@ def bilevel_angle_step(
             or float(vector_norm.detach().cpu().item()) <= 0.0
         ):
             raise RuntimeError(
-                "bilevel validation gradient has zero or nonfinite norm"
+                "bilevel outer gradient has zero or nonfinite norm"
             )
         epsilon = (
             float(args.bilevel_hvp_radius)
@@ -532,7 +562,7 @@ def bilevel_angle_step(
         def perturb(scale):
             with torch.no_grad():
                 for parameter, gradient in zip(
-                    weight_parameters, validation_vector
+                    weight_parameters, outer_vector
                 ):
                     if gradient is not None:
                         parameter.add_(
@@ -664,7 +694,7 @@ def run_epoch(
     optimizer=None,
     collect_outputs=False,
     bilevel_angle_optimizer=None,
-    bilevel_validation_batches=None,
+    bilevel_outer_batches=None,
     hypo_loss_function=None,
     hypo_loss_scale=1.0,
 ):
@@ -691,18 +721,18 @@ def run_epoch(
         batch = move_batch_to_device(batch, device)
         if training:
             if bilevel_angle_optimizer is not None:
-                if bilevel_validation_batches is None:
+                if bilevel_outer_batches is None:
                     raise ValueError(
-                        "bilevel training requires validation batches"
+                        "bilevel training requires outer batches"
                     )
-                validation_batch = move_batch_to_device(
-                    next(bilevel_validation_batches),
+                outer_batch = move_batch_to_device(
+                    next(bilevel_outer_batches),
                     device,
                 )
                 bilevel_metrics = bilevel_angle_step(
                     model,
                     batch,
-                    validation_batch,
+                    outer_batch,
                     class_weights,
                     circular_loss_function,
                     args,
@@ -1234,7 +1264,12 @@ def write_epoch_metrics(path, rows):
     flattened = []
     for row in rows:
         item = {"epoch": row["epoch"], "seconds": row["seconds"]}
-        for split in ("training", "validation", "testing"):
+        for split in (
+            "training",
+            "angle_holdout",
+            "validation",
+            "testing",
+        ):
             if split not in row:
                 continue
             for key, value in row[split].items():
@@ -1309,6 +1344,7 @@ def experiment_directory_name(
     hypo_alignment_weight=1.0,
     hypo_warmup_epochs=0,
     hypo_ramp_epochs=0,
+    angle_holdout_ratio=0.10,
 ):
     if mode in PRIOR_FREE_HYPO_MODES:
         condition = "{}_lambda_{}_w{}_tau{}_pm{}".format(
@@ -1379,21 +1415,38 @@ def experiment_directory_name(
                 all_gap_learning_source
             )
     elif mode in BILEVEL_SHARED_GAP_MODES:
-        condition = (
-            "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
-        ).format(
-            mode,
-            format(float(circular_weight), "g"),
-            format(float(bilevel_gap_minimum_degrees), "g"),
-            format(float(bilevel_gap_maximum_degrees), "g"),
-            format(float(bilevel_gap_initial_degrees), "g"),
-            format(float(confused_cse_pair_weight), "g"),
-            format(float(confusion_classification_margin), "g"),
-            format(float(confusion_classification_weight), "g"),
-            format(float(bilevel_angle_learning_rate), "g"),
-            format(float(bilevel_outer_confusion_weight), "g"),
-        )
+        if mode in TRAIN_HOLDOUT_BILEVEL_MODES:
+            condition = (
+                "{}_l{}_r{}-{}_i{}_p{}_cm{}_cw{}_alr{}_oc{}_ah{}"
+            ).format(
+                mode,
+                format(float(circular_weight), "g"),
+                format(float(bilevel_gap_minimum_degrees), "g"),
+                format(float(bilevel_gap_maximum_degrees), "g"),
+                format(float(bilevel_gap_initial_degrees), "g"),
+                format(float(confused_cse_pair_weight), "g"),
+                format(float(confusion_classification_margin), "g"),
+                format(float(confusion_classification_weight), "g"),
+                format(float(bilevel_angle_learning_rate), "g"),
+                format(float(bilevel_outer_confusion_weight), "g"),
+                format(float(angle_holdout_ratio), "g"),
+            )
+        else:
+            condition = (
+                "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
+                "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+            ).format(
+                mode,
+                format(float(circular_weight), "g"),
+                format(float(bilevel_gap_minimum_degrees), "g"),
+                format(float(bilevel_gap_maximum_degrees), "g"),
+                format(float(bilevel_gap_initial_degrees), "g"),
+                format(float(confused_cse_pair_weight), "g"),
+                format(float(confusion_classification_margin), "g"),
+                format(float(confusion_classification_weight), "g"),
+                format(float(bilevel_angle_learning_rate), "g"),
+                format(float(bilevel_outer_confusion_weight), "g"),
+            )
     elif mode in CONFUSION_MARGIN_MODES:
         condition = (
             "{}_{}_lambda_{}_mingap_{}_pair_{}_"
@@ -1574,18 +1627,19 @@ def confusion_gap_payload(
 ):
     state = current_angle_state(model, fixed_class_angles)
     angles = state["angles"]
+    pairs = confusion_gap_pairs_for_mode(model.experiment_mode)
     distances = circular_pair_distances(
         angles,
-        IEMOCAP_CONFUSION_PAIRS,
+        pairs,
     )
     penalty = minimum_confusion_gap_regularization(
         angles,
         minimum_gap_degrees=minimum_gap_degrees,
-        pairs=IEMOCAP_CONFUSION_PAIRS,
+        pairs=pairs,
     )
     pair_gaps = {}
     for pair, distance in zip(
-        IEMOCAP_CONFUSION_PAIRS,
+        pairs,
         distances.detach().cpu().tolist(),
     ):
         first_id, second_id = pair
@@ -1605,7 +1659,7 @@ def confusion_gap_payload(
                 "second_id": int(second_id),
                 "second_emotion": ID2EMOTION[second_id],
             }
-            for first_id, second_id in IEMOCAP_CONFUSION_PAIRS
+            for first_id, second_id in pairs
         ],
         "confusion_pair_gaps_degrees": pair_gaps,
         "confusion_gap_regularization": float(
@@ -1711,6 +1765,12 @@ def bilevel_gap_payload(model, args):
     return {
         "parameterization": (
             "shared_confusion_gap_with_balanced_remaining_gaps"
+        ),
+        "learning_source": bilevel_outer_split_name(args),
+        "angle_holdout_ratio": (
+            float(args.angle_holdout_ratio)
+            if args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES
+            else None
         ),
         "minimum_degrees": float(
             args.bilevel_gap_minimum_degrees
@@ -1963,6 +2023,8 @@ def save_checkpoint(
         "selected_epoch": epoch,
         "validation_metrics": validation_metrics,
         "selection_protocol": args.selection_protocol,
+        "angle_learning_split": bilevel_outer_split_name(args),
+        "angle_holdout_ratio": args.angle_holdout_ratio,
         "selection_split": (
             "testing"
             if args.selection_protocol == "test"
@@ -2049,6 +2111,12 @@ def final_classification_details(labels, predictions):
 
 def validate_arguments(args):
     apply_hypo_mode_defaults(args)
+    if args.angle_holdout_ratio is None:
+        args.angle_holdout_ratio = (
+            0.10
+            if args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES
+            else 0.0
+        )
     if args.epochs < 1:
         raise ValueError("--epochs must be positive")
     if args.batch_size < 1:
@@ -2070,6 +2138,45 @@ def validate_arguments(args):
             "--selection-protocol must be one of {}".format(
                 SELECTION_PROTOCOLS
             )
+        )
+    if (
+        not np.isfinite(args.validation_ratio)
+        or not 0.0 < args.validation_ratio < 1.0
+    ):
+        raise ValueError(
+            "--validation-ratio must be finite and in (0, 1)"
+        )
+    if (
+        not np.isfinite(args.angle_holdout_ratio)
+        or args.angle_holdout_ratio < 0.0
+        or args.angle_holdout_ratio >= 1.0
+    ):
+        raise ValueError(
+            "--angle-holdout-ratio must be finite and in [0, 1)"
+        )
+    if args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES:
+        if args.angle_holdout_ratio <= 0.0:
+            raise ValueError(
+                "train-holdout bilevel mode requires a positive "
+                "--angle-holdout-ratio"
+            )
+        if (
+            args.validation_ratio + args.angle_holdout_ratio
+            >= 1.0
+        ):
+            raise ValueError(
+                "--validation-ratio + --angle-holdout-ratio must "
+                "be below 1"
+            )
+        if args.selection_protocol != "validation":
+            raise ValueError(
+                "train-holdout bilevel mode requires validation-only "
+                "checkpoint selection"
+            )
+    elif args.angle_holdout_ratio != 0.0:
+        raise ValueError(
+            "--angle-holdout-ratio applies only to "
+            "sdt_cse_bilevel_confusion_gap_train_holdout"
         )
     if args.sdt_residual_update not in SDT_RESIDUAL_UPDATES:
         raise ValueError(
@@ -2191,6 +2298,14 @@ def validate_arguments(args):
         raise ValueError(
             "--minimum-confusion-gap-degrees must be finite and "
             "in (0, 180]"
+        )
+    if (
+        args.experiment_mode in THREE_PAIR_CONFUSION_GAP_MODES
+        and args.minimum_confusion_gap_degrees >= 120.0
+    ):
+        raise ValueError(
+            "three confusion gaps require "
+            "--minimum-confusion-gap-degrees below 120"
         )
     if (
         not np.isfinite(args.confused_cse_pair_weight)
@@ -2342,6 +2457,7 @@ def train_and_test(args):
         feature_path=args.feature_path,
         batch_size=args.batch_size,
         validation_ratio=args.validation_ratio,
+        angle_holdout_ratio=args.angle_holdout_ratio,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         selection_protocol=args.selection_protocol,
@@ -2379,6 +2495,7 @@ def train_and_test(args):
             args.hypo_alignment_weight,
             args.hypo_warmup_epochs,
             args.hypo_ramp_epochs,
+            args.angle_holdout_ratio,
         ),
         "seed_{}".format(args.seed),
     )
@@ -2500,19 +2617,19 @@ def train_and_test(args):
         if args.experiment_mode in HYPO_MODES
         else None
     )
-    validation_gap_learning = uses_validation_gap_learning(args)
+    bilevel_gap_learning = uses_bilevel_gap_learning(args)
     optimizer = build_optimizer(
         model,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        exclude_angle_parameters=validation_gap_learning,
+        exclude_angle_parameters=bilevel_gap_learning,
     )
     angle_optimizer = (
         build_bilevel_angle_optimizer(
             model,
             learning_rate=args.bilevel_angle_learning_rate,
         )
-        if validation_gap_learning
+        if bilevel_gap_learning
         else None
     )
 
@@ -2531,9 +2648,10 @@ def train_and_test(args):
         else "validation"
     )
     selection_loader = loaders[selection_name]
-    bilevel_validation_batches = (
-        cycle_batches(loaders["validation"])
-        if validation_gap_learning
+    outer_split_name = bilevel_outer_split_name(args)
+    bilevel_outer_batches = (
+        cycle_batches(loaders[outer_split_name])
+        if outer_split_name is not None
         else None
     )
 
@@ -2556,7 +2674,7 @@ def train_and_test(args):
             args,
             optimizer=optimizer,
             bilevel_angle_optimizer=angle_optimizer,
-            bilevel_validation_batches=bilevel_validation_batches,
+            bilevel_outer_batches=bilevel_outer_batches,
             hypo_loss_function=hypo_loss_function,
             hypo_loss_scale=epoch_hypo_scale,
         )
@@ -2572,6 +2690,20 @@ def train_and_test(args):
                 )
             )
         with torch.no_grad():
+            angle_holdout_result = (
+                run_epoch(
+                    model,
+                    loaders["angle_holdout_export"],
+                    device,
+                    class_weights,
+                    circular_loss_function,
+                    args,
+                    hypo_loss_function=hypo_loss_function,
+                    hypo_loss_scale=epoch_hypo_scale,
+                )
+                if loaders["angle_holdout_export"] is not None
+                else None
+            )
             selection = run_epoch(
                 model,
                 selection_loader,
@@ -2588,6 +2720,10 @@ def train_and_test(args):
             "training": public_metrics(training),
             selection_name: public_metrics(selection),
         }
+        if angle_holdout_result is not None:
+            row["angle_holdout"] = public_metrics(
+                angle_holdout_result
+            )
         epoch_rows.append(row)
         write_epoch_metrics(
             os.path.join(run_dir, "epoch_metrics.csv"),
@@ -2692,7 +2828,7 @@ def train_and_test(args):
                         name: training.get(name)
                         for name in BILEVEL_METRIC_NAMES
                     }
-                    if validation_gap_learning
+                    if bilevel_gap_learning
                     else None
                 ),
                 hypo_loss_function=hypo_loss_function,
@@ -2801,6 +2937,20 @@ def train_and_test(args):
             hypo_loss_function=hypo_loss_function,
             hypo_loss_scale=selected_hypo_scale,
         )
+        selected_angle_holdout = (
+            run_epoch(
+                model,
+                loaders["angle_holdout_export"],
+                device,
+                class_weights,
+                circular_loss_function,
+                args,
+                hypo_loss_function=hypo_loss_function,
+                hypo_loss_scale=selected_hypo_scale,
+            )
+            if loaders["angle_holdout_export"] is not None
+            else None
+        )
         if loaders["validation"] is not None:
             (
                 selected_validation,
@@ -2874,6 +3024,11 @@ def train_and_test(args):
         if selected_validation is not None
         else None
     )
+    angle_holdout_metrics = (
+        public_metrics(selected_angle_holdout)
+        if selected_angle_holdout is not None
+        else None
+    )
     validation_report = {
         "selected_epoch": best_epoch,
         "available": selected_validation is not None,
@@ -2889,6 +3044,14 @@ def train_and_test(args):
         os.path.join(run_dir, "validation_metrics.json"),
         validation_report,
     )
+    if angle_holdout_metrics is not None:
+        write_json(
+            os.path.join(run_dir, "angle_holdout_metrics.json"),
+            {
+                "selected_epoch": best_epoch,
+                **angle_holdout_metrics,
+            },
+        )
     test_metrics = public_metrics(testing)
     test_metrics.update(
         final_classification_details(
@@ -2997,6 +3160,13 @@ def train_and_test(args):
             else None
         ),
         "selection_protocol": args.selection_protocol,
+        "angle_learning_split": bilevel_outer_split_name(args),
+        "angle_holdout_ratio": args.angle_holdout_ratio,
+        "angle_holdout_metrics_path": (
+            "angle_holdout_metrics.json"
+            if angle_holdout_metrics is not None
+            else None
+        ),
         "selection_split": selection_name,
         "selection_metrics": best_selection,
         "seed": args.seed,
@@ -3087,6 +3257,7 @@ def train_and_test(args):
         ),
         "selected_epoch": best_epoch,
         "training": training_metrics,
+        "angle_holdout": angle_holdout_metrics,
         "validation": validation_metrics,
         "test": public_metrics(testing),
         "fusion_geometry": fusion_geometry,
@@ -3235,8 +3406,8 @@ def build_argument_parser():
         default=0.1,
         help=(
             "weight for the minimum happy-excited and "
-            "angry-frustrated angular-gap penalty in confusion-gap "
-            "mode (default: %(default)s)"
+            "angry-frustrated angular-gap penalty, plus sad-neutral "
+            "in the three-pair mode (default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -3245,7 +3416,7 @@ def build_argument_parser():
         default=75.0,
         help=(
             "minimum shortest angle for predefined confusion pairs "
-            "in confusion-gap mode (default: %(default)s)"
+            "in confusion-gap modes (default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -3396,6 +3567,16 @@ def build_argument_parser():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--validation-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--angle-holdout-ratio",
+        type=float,
+        default=None,
+        help=(
+            "fraction of trainVid reserved exclusively for bilevel "
+            "angle selection; defaults to 0.1 in the train-holdout "
+            "mode and 0 otherwise"
+        ),
+    )
     parser.add_argument(
         "--selection-protocol",
         choices=SELECTION_PROTOCOLS,

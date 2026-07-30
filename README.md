@@ -19,9 +19,11 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_fusion_only` | Spherical projection + cosine | None | No | Yes |
 | `sdt_cse_learnable_angles` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles |
 | `sdt_cse_learnable_angles_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Learnable ordered angles with minimum confusion gaps |
+| `sdt_cse_learnable_angles_confusion_gap_sad_neutral` | Spherical projection + cosine | Original linear | Yes | Old confusion-gap mode with an additional sad-neutral minimum gap |
 | `sdt_cse_learnable_angles_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Old six-angle confusion-gap objective + stabilized circle-aligned HYPO |
 | `sdt_cse_confusion_margin` | Spherical projection + cosine | Original linear | Yes | Fixed 75-degree confusion gaps with weighted confused pairs |
 | `sdt_cse_bilevel_confusion_gap` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from validation classification |
+| `sdt_cse_bilevel_confusion_gap_train_holdout` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from a dedicated 10% trainVid holdout |
 | `sdt_cse_bilevel_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Bilevel circular gap + circle-aligned HYPO prototypes |
 | `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | Six hard-floor ordered gaps learned from validation or training |
 
@@ -63,6 +65,9 @@ The comparisons have distinct purposes:
 - `sdt_cse_learnable_angles_confusion_gap_hypo_aligned -
   sdt_cse_learnable_angles_confusion_gap` isolates stabilized,
   circle-aware HYPO while preserving the old six-angle learner.
+- `sdt_cse_learnable_angles_confusion_gap_sad_neutral -
+  sdt_cse_learnable_angles_confusion_gap` isolates adding sad-neutral
+  to the original two minimum-gap pairs.
 
 - `sdt_cse_confusion_margin - sdt_cse` measures the combined effect of a
   fixed constrained geometry, stronger CircularCSE supervision for the two
@@ -71,6 +76,10 @@ The comparisons have distinct purposes:
 - `sdt_cse_bilevel_confusion_gap - sdt_cse_confusion_margin` replaces the
   fixed gap by one bounded shared gap whose hypergradient comes from
   validation fusion classification.
+- `sdt_cse_bilevel_confusion_gap_train_holdout -
+  sdt_cse_bilevel_confusion_gap` changes only the outer-data source:
+  a dedicated trainVid holdout learns the angle, while validation is
+  reserved for checkpoint selection.
 - `sdt_cse_bilevel_all_gaps - sdt_cse_bilevel_confusion_gap` removes the
   equal-confusion/equal-remaining-gap restriction and validation-learns all
   six consecutive gaps while preserving their circular order.
@@ -258,6 +267,22 @@ The ordered positive-gap parameterization remains unchanged, so the circular
 order and total circumference are preserved. Increasing these two gaps
 redistributes the remaining circumference across the other four gaps.
 
+`sdt_cse_learnable_angles_confusion_gap_sad_neutral` uses the same objective,
+optimizer, prior-angle regularization, and six-angle parameterization. Its
+gap penalty contains three terms:
+
+```text
+confusion_gap_weight * (
+  relu(75 degrees - gap(happy, excited))^2
+  + relu(75 degrees - gap(angry, frustrated))^2
+  + relu(75 degrees - gap(sad, neutral))^2
+)
+```
+
+The three pairs are alternating consecutive gaps in the fixed circular
+order. At the default 75-degree minimum, they can occupy 225 degrees while
+the other three gaps share the remaining 135 degrees.
+
 `sdt_cse_learnable_angles_confusion_gap_hypo_aligned` preserves that entire
 objective and adds:
 
@@ -345,6 +370,29 @@ differentiates through one virtual SGD step while the actual model optimizer
 is Adam. It performs three additional forward/backward evaluations per
 training minibatch and is therefore substantially slower than fixed-angle
 training.
+
+`sdt_cse_bilevel_confusion_gap_train_holdout` keeps the identical shared-gap
+parameterization, inner objective, outer classification objective, and DARTS
+hypergradient, but changes the data protocol to four disjoint dialogue-level
+splits:
+
+```text
+trainVid:
+  first 10%  -> validation (checkpoint selection only)
+  next 10%   -> angle_holdout (bilevel outer objective only)
+  final 80%  -> model training
+
+testVid:
+  100%       -> final test only
+```
+
+The ratios are controlled by `--validation-ratio` and
+`--angle-holdout-ratio`, both defaulting to `0.1` in this mode. Model
+parameters never receive a direct optimizer step from the angle holdout.
+Validation is evaluated under `torch.no_grad()` and is never passed to the
+angle optimizer. The exact dialogue IDs are saved in `split_ids.json` and
+the selected holdout metrics are written to
+`angle_holdout_metrics.json`.
 
 For `sdt_cse_bilevel_all_gaps`, every consecutive gap has its own learned
 allocation:
@@ -594,6 +642,17 @@ python train.py \
   --confusion-gap-weight 0.1 \
   --seed 2024
 python train.py \
+  --experiment-mode sdt_cse_learnable_angles_confusion_gap_sad_neutral \
+  --selection-protocol validation \
+  --circular-geometry equal \
+  --circular-weight 0.1 \
+  --angle-weight 0.1 \
+  --minimum-confusion-gap-degrees 75 \
+  --confusion-gap-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+python train.py \
   --experiment-mode sdt_cse_learnable_angles_confusion_gap_hypo_aligned \
   --selection-protocol validation \
   --circular-geometry equal \
@@ -619,6 +678,25 @@ python train.py \
 python train.py \
   --experiment-mode sdt_cse_bilevel_confusion_gap \
   --selection-protocol validation \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-gap-minimum-degrees 70 \
+  --bilevel-gap-maximum-degrees 110 \
+  --bilevel-gap-initial-degrees 90 \
+  --bilevel-angle-learning-rate 0.001 \
+  --bilevel-inner-step-size 0.0001 \
+  --bilevel-hvp-radius 0.01 \
+  --bilevel-outer-confusion-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
+python train.py \
+  --experiment-mode sdt_cse_bilevel_confusion_gap_train_holdout \
+  --selection-protocol validation \
+  --validation-ratio 0.1 \
+  --angle-holdout-ratio 0.1 \
   --circular-weight 0.1 \
   --confused-cse-pair-weight 5 \
   --confusion-classification-margin 0.1 \
@@ -783,6 +861,16 @@ This starts both confusion gaps at 90 degrees and constrains them to
 hypergradient calculation, expect this launcher to take several times
 longer than the fixed-angle experiment.
 
+Run the train-holdout counterpart with validation reserved for checkpoint
+selection:
+
+```bash
+GPU_ID=0 bash exec_iemocap_bilevel_confusion_gap_train_holdout.sh
+```
+
+This uses 80% of `trainVid` for model updates, 10% for angle
+hypergradients, and 10% for validation checkpoint selection.
+
 Run the circle-aligned HYPO hybrid over the same seeds:
 
 ```bash
@@ -793,6 +881,16 @@ This launcher uses the requested 50-150 degree range, 90-degree
 initialization, and training-only EMA prototypes. At the 150-degree upper
 bound, the four remaining circular gaps are 15 degrees; treat this wide
 range as a sensitivity experiment.
+
+Run the three-pair extension of the original learnable confusion-gap mode:
+
+```bash
+GPU_ID=0 \
+  bash exec_iemocap_learnable_angles_confusion_gap_sad_neutral.sh
+```
+
+This uses the same 75-degree minimum and `0.1` gap-loss weight for
+happy-excited, angry-frustrated, and sad-neutral.
 
 Run the stabilized HYPO augmentation of the old six-angle confusion-gap
 mode over seeds 2024-2033:

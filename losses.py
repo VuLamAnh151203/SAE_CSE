@@ -17,6 +17,10 @@ IEMOCAP_CONFUSION_PAIRS = (
     (0, 4),  # happy -> excited
     (3, 5),  # angry -> frustrated
 )
+IEMOCAP_THREE_CONFUSION_GAP_PAIRS = (
+    *IEMOCAP_CONFUSION_PAIRS,
+    (1, 2),  # sad -> neutral
+)
 EMOTION_NAMES = [ID2EMOTION[index] for index in range(len(ID2EMOTION))]
 IEMOCAP_CLASS_FREQUENCIES = (
     0.086747,
@@ -723,6 +727,7 @@ def compute_sdt_cse_losses(
     angle_weight=0.0,
     confusion_gap_weight=0.0,
     minimum_confusion_gap_degrees=75.0,
+    confusion_gap_pairs=IEMOCAP_CONFUSION_PAIRS,
     confusion_classification_weight=0.0,
     confusion_classification_margin=0.1,
     hypo_loss_function=None,
@@ -948,6 +953,7 @@ def compute_sdt_cse_losses(
                 minimum_gap_degrees=(
                     minimum_confusion_gap_degrees
                 ),
+                pairs=confusion_gap_pairs,
             )
         )
     elif confusion_gap_weight > 0:

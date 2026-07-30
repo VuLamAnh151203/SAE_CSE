@@ -66,6 +66,75 @@ def fixed_train_validation_test_split(
     }
 
 
+def fixed_train_angle_validation_test_split(
+    train_vids,
+    test_vids,
+    validation_ratio=0.10,
+    angle_holdout_ratio=0.10,
+):
+    """Create disjoint model-train, angle, validation, and test splits."""
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError("validation_ratio must be between 0 and 1")
+    if not 0.0 < angle_holdout_ratio < 1.0:
+        raise ValueError("angle_holdout_ratio must be between 0 and 1")
+    if validation_ratio + angle_holdout_ratio >= 1.0:
+        raise ValueError(
+            "validation_ratio + angle_holdout_ratio must be below 1"
+        )
+
+    train_vids = list(train_vids)
+    test_vids = list(test_vids)
+    validation_size = int(validation_ratio * len(train_vids))
+    angle_holdout_size = int(
+        angle_holdout_ratio * len(train_vids)
+    )
+    if validation_size < 1:
+        raise ValueError("validation split is empty")
+    if angle_holdout_size < 1:
+        raise ValueError("angle-holdout split is empty")
+    if validation_size + angle_holdout_size >= len(train_vids):
+        raise ValueError("model-training split is empty")
+
+    validation_end = validation_size
+    angle_holdout_end = validation_end + angle_holdout_size
+    split_ids = {
+        "training": train_vids[angle_holdout_end:],
+        "angle_holdout": train_vids[
+            validation_end:angle_holdout_end
+        ],
+        "validation": train_vids[:validation_end],
+        "testing": test_vids,
+    }
+    split_sets = {
+        name: set(keys) for name, keys in split_ids.items()
+    }
+    for name, keys in split_ids.items():
+        if len(split_sets[name]) != len(keys):
+            raise ValueError(
+                "{} dialogue IDs contain duplicates".format(name)
+            )
+    names = tuple(split_ids)
+    for index, first in enumerate(names):
+        for second in names[index + 1 :]:
+            if split_sets[first] & split_sets[second]:
+                raise ValueError(
+                    "{} and {} sets overlap".format(first, second)
+                )
+    reconstructed_train = (
+        split_sets["training"]
+        | split_sets["angle_holdout"]
+        | split_sets["validation"]
+    )
+    if reconstructed_train != set(train_vids):
+        raise ValueError(
+            "training/angle-holdout/validation do not reconstruct "
+            "trainVid"
+        )
+    if split_sets["testing"] != set(test_vids):
+        raise ValueError("testing set does not match testVid")
+    return split_ids
+
+
 def original_test_selection_split(train_vids, test_vids):
     """Reproduce SDT's all-train/test-selection dataset membership."""
     training_keys = list(train_vids)
@@ -235,6 +304,7 @@ def create_iemocap_loaders(
     num_workers=0,
     pin_memory=False,
     selection_protocol="validation",
+    angle_holdout_ratio=0.0,
 ):
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -245,7 +315,19 @@ def create_iemocap_loaders(
             )
         )
     dataset = IEMOCAPDataset(feature_path)
-    if selection_protocol == "validation":
+    if angle_holdout_ratio > 0.0:
+        if selection_protocol != "validation":
+            raise ValueError(
+                "angle holdout requires validation checkpoint "
+                "selection"
+            )
+        split_ids = fixed_train_angle_validation_test_split(
+            dataset.trainVid,
+            dataset.testVid,
+            validation_ratio=validation_ratio,
+            angle_holdout_ratio=angle_holdout_ratio,
+        )
+    elif selection_protocol == "validation":
         split_ids = fixed_train_validation_test_split(
             dataset.trainVid,
             dataset.testVid,
@@ -289,6 +371,31 @@ def create_iemocap_loaders(
         if split_indices["validation"]
         else None
     )
+    angle_holdout_indices = split_indices.get("angle_holdout", [])
+    angle_holdout = (
+        DataLoader(
+            Subset(dataset, angle_holdout_indices),
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=dataset.collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if angle_holdout_indices
+        else None
+    )
+    angle_holdout_export = (
+        DataLoader(
+            Subset(dataset, angle_holdout_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=dataset.collate_fn,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        if angle_holdout_indices
+        else None
+    )
     testing = DataLoader(
         Subset(dataset, split_indices["testing"]),
         batch_size=batch_size,
@@ -301,6 +408,8 @@ def create_iemocap_loaders(
         "dataset": dataset,
         "training": training,
         "training_export": training_export,
+        "angle_holdout": angle_holdout,
+        "angle_holdout_export": angle_holdout_export,
         "validation": validation,
         "testing": testing,
         "split_ids": split_ids,

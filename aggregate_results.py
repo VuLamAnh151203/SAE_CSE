@@ -33,6 +33,9 @@ METRICS = (
     "angry_frustrated_pair_macro_f1",
     "angry_frustrated_pair_weighted_f1",
     "angry_frustrated_mutual_confusion_rate",
+    "sad_neutral_pair_macro_f1",
+    "sad_neutral_pair_weighted_f1",
+    "sad_neutral_mutual_confusion_rate",
 )
 ORDERED_GAP_NAMES = (
     "happy_to_excited",
@@ -41,6 +44,11 @@ ORDERED_GAP_NAMES = (
     "frustrated_to_sad",
     "sad_to_neutral",
     "neutral_to_happy",
+)
+CONFUSION_GAP_NAMES = (
+    "happy_excited",
+    "angry_frustrated",
+    "sad_neutral",
 )
 
 
@@ -188,46 +196,139 @@ def condition_name(summary):
                 "g",
             ),
         )
-    elif mode == "sdt_cse_bilevel_confusion_gap":
+    elif mode in (
+        "sdt_cse_bilevel_confusion_gap",
+        "sdt_cse_bilevel_confusion_gap_train_holdout",
+    ):
         geometry = summary.get("bilevel_geometry") or {}
-        condition = (
-            "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
-        ).format(
-            mode,
-            format(float(summary["circular_weight"]), "g"),
-            format(float(geometry.get("minimum_degrees", 70.0)), "g"),
-            format(float(geometry.get("maximum_degrees", 110.0)), "g"),
-            format(float(geometry.get("initial_degrees", 90.0)), "g"),
-            format(
-                float(summary.get("confused_cse_pair_weight", 5.0)),
-                "g",
-            ),
-            format(
-                float(
-                    summary.get(
-                        "confusion_classification_margin", 0.1
-                    )
+        if mode == "sdt_cse_bilevel_confusion_gap_train_holdout":
+            condition = (
+                "{}_l{}_r{}-{}_i{}_p{}_cm{}_cw{}_alr{}_oc{}_ah{}"
+            ).format(
+                mode,
+                format(float(summary["circular_weight"]), "g"),
+                format(
+                    float(geometry.get("minimum_degrees", 70.0)),
+                    "g",
                 ),
-                "g",
-            ),
-            format(
-                float(
-                    summary.get(
-                        "confusion_classification_weight", 0.1
-                    )
+                format(
+                    float(geometry.get("maximum_degrees", 110.0)),
+                    "g",
                 ),
-                "g",
-            ),
-            format(
-                float(geometry.get("angle_learning_rate", 0.001)),
-                "g",
-            ),
-            format(
-                float(geometry.get("outer_confusion_weight", 0.1)),
-                "g",
-            ),
-        )
+                format(
+                    float(geometry.get("initial_degrees", 90.0)),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confused_cse_pair_weight", 5.0
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_margin", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "angle_learning_rate", 0.001
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "outer_confusion_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "angle_holdout_ratio",
+                            summary.get("angle_holdout_ratio", 0.1),
+                        )
+                    ),
+                    "g",
+                ),
+            )
+        else:
+            condition = (
+                "{}_lambda_{}_range_{}-{}_init_{}_pair_{}_"
+                "clsmargin_{}_clsweight_{}_anglelr_{}_outerconf_{}"
+            ).format(
+                mode,
+                format(float(summary["circular_weight"]), "g"),
+                format(
+                    float(geometry.get("minimum_degrees", 70.0)),
+                    "g",
+                ),
+                format(
+                    float(geometry.get("maximum_degrees", 110.0)),
+                    "g",
+                ),
+                format(
+                    float(geometry.get("initial_degrees", 90.0)),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confused_cse_pair_weight", 5.0
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_margin", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "angle_learning_rate", 0.001
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get(
+                            "outer_confusion_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+            )
     elif mode == "sdt_cse_confusion_margin":
         condition = (
             "{}_{}_lambda_{}_mingap_{}_pair_{}_"
@@ -318,7 +419,10 @@ def condition_name(summary):
             int(summary.get("hypo_warmup_epochs", 10)),
             int(summary.get("hypo_ramp_epochs", 20)),
         )
-    elif mode == "sdt_cse_learnable_angles_confusion_gap":
+    elif mode in (
+        "sdt_cse_learnable_angles_confusion_gap",
+        "sdt_cse_learnable_angles_confusion_gap_sad_neutral",
+    ):
         geometry = summary.get("circular_geometry", "equal")
         condition = (
             "{}_{}_lambda_{}_angle_{}_mingap_{}_gap_{}"
@@ -443,10 +547,19 @@ def aggregate(output_dir):
         named_gaps = bilevel_geometry.get(
             "named_gaps_degrees", {}
         )
+        confusion_pair_gaps = summary.get(
+            "confusion_pair_gaps_degrees"
+        ) or {}
         row = {
             "condition": condition,
             "seed": summary["seed"],
             "selected_epoch": summary["selected_epoch"],
+            "angle_learning_split": summary.get(
+                "angle_learning_split"
+            ),
+            "angle_holdout_ratio": summary.get(
+                "angle_holdout_ratio"
+            ),
             "sdt_residual_update": summary.get(
                 "sdt_residual_update", "standard"
             ),
@@ -504,11 +617,21 @@ def aggregate(output_dir):
             row[
                 "selected_gap_{}_degrees".format(gap_name)
             ] = named_gaps.get(gap_name)
+        for pair_name in CONFUSION_GAP_NAMES:
+            row[
+                "selected_confusion_gap_{}_degrees".format(
+                    pair_name
+                )
+            ] = confusion_pair_gaps.get(pair_name)
         validation = summary.get("validation") or {}
+        angle_holdout = summary.get("angle_holdout") or {}
         for metric in METRICS:
             row["test_{}".format(metric)] = summary["test"].get(metric)
             row["validation_{}".format(metric)] = validation.get(
                 metric
+            )
+            row["angle_holdout_{}".format(metric)] = (
+                angle_holdout.get(metric)
             )
         row.update(residual_gate_statistics(summary))
         rows.append(row)
@@ -525,6 +648,12 @@ def aggregate(output_dir):
         item = {
             "condition": condition,
             "runs": len(condition_rows),
+            "angle_learning_split": condition_rows[0].get(
+                "angle_learning_split"
+            ),
+            "angle_holdout_ratio": condition_rows[0].get(
+                "angle_holdout_ratio"
+            ),
             "hypo_loss_weight": condition_rows[0].get(
                 "hypo_loss_weight"
             ),
@@ -585,6 +714,26 @@ def aggregate(output_dir):
                 if validation_values.size
                 else ""
             )
+            angle_holdout_values = np.asarray(
+                [
+                    row["angle_holdout_{}".format(metric)]
+                    for row in condition_rows
+                    if row[
+                        "angle_holdout_{}".format(metric)
+                    ] is not None
+                ],
+                dtype=np.float64,
+            )
+            item["angle_holdout_{}_mean".format(metric)] = (
+                float(angle_holdout_values.mean())
+                if angle_holdout_values.size
+                else ""
+            )
+            item["angle_holdout_{}_std".format(metric)] = (
+                float(angle_holdout_values.std())
+                if angle_holdout_values.size
+                else ""
+            )
         for metric in (
             "final_attention_alpha_mean",
             "final_mlp_alpha_mean",
@@ -599,6 +748,10 @@ def aggregate(output_dir):
             *(
                 "selected_gap_{}_degrees".format(name)
                 for name in ORDERED_GAP_NAMES
+            ),
+            *(
+                "selected_confusion_gap_{}_degrees".format(name)
+                for name in CONFUSION_GAP_NAMES
             ),
         ):
             values = np.asarray(

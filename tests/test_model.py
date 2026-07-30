@@ -16,6 +16,7 @@ if PROJECT_DIR not in sys.path:
 
 from losses import (  # noqa: E402
     CircularCSELoss,
+    IEMOCAP_THREE_CONFUSION_GAP_PAIRS,
     build_iemocap_angles,
     build_target_similarity,
     compute_sdt_cse_losses,
@@ -33,16 +34,20 @@ from model import (  # noqa: E402
     SphericalResidualUpdate,
     SphericalFusionHead,
     TransformerEncoder,
+    THREE_PAIR_CONFUSION_GAP_MODES,
 )
 from train import (  # noqa: E402
     _compute_batch_losses,
     angle_history_row,
     bilevel_angle_step,
+    bilevel_outer_split_name,
     build_argument_parser,
     build_bilevel_angle_optimizer,
     build_optimizer,
+    confusion_gap_pairs_for_mode,
     save_checkpoint,
     spherical_residual_history_row,
+    uses_bilevel_gap_learning,
     uses_validation_gap_learning,
     validate_arguments,
 )
@@ -106,6 +111,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse_learnable_angles_confusion_gap",
             "sdt_cse_confusion_margin",
             "sdt_cse_bilevel_confusion_gap",
+            "sdt_cse_bilevel_confusion_gap_train_holdout",
             "sdt_cse_bilevel_all_gaps",
         ):
             model = make_model(mode).eval()
@@ -216,6 +222,7 @@ class ModelModeTest(unittest.TestCase):
                 "sdt_cse_learnable_angles",
                 "sdt_cse_learnable_angles_confusion_gap",
                 "sdt_cse_bilevel_confusion_gap",
+                "sdt_cse_bilevel_confusion_gap_train_holdout",
                 "sdt_cse_bilevel_all_gaps",
             ):
                 self.assertIsNotNone(model.circular_angle_learner)
@@ -237,6 +244,7 @@ class ModelModeTest(unittest.TestCase):
                 in (
                     "sdt_cse_confusion_margin",
                     "sdt_cse_bilevel_confusion_gap",
+                    "sdt_cse_bilevel_confusion_gap_train_holdout",
                     "sdt_cse_bilevel_all_gaps",
                 ),
             )
@@ -842,29 +850,53 @@ class BilevelConfusionGapTest(unittest.TestCase):
             self.assertAlmostEqual(float(gaps.sum()), 360.0, places=4)
 
     def test_bilevel_optimizer_excludes_gap_from_inner_optimizer(self):
-        model = make_model("sdt_cse_bilevel_confusion_gap")
-        inner = build_optimizer(
-            model,
-            1e-4,
-            1e-5,
-            exclude_angle_parameters=True,
+        for mode in (
+            "sdt_cse_bilevel_confusion_gap",
+            "sdt_cse_bilevel_confusion_gap_train_holdout",
+        ):
+            model = make_model(mode)
+            inner = build_optimizer(
+                model,
+                1e-4,
+                1e-5,
+                exclude_angle_parameters=True,
+            )
+            outer = build_bilevel_angle_optimizer(model, 1e-3)
+            gap_id = id(model.circular_angle_learner.raw_gaps)
+            inner_ids = {
+                id(parameter)
+                for group in inner.param_groups
+                for parameter in group["params"]
+            }
+            outer_ids = {
+                id(parameter)
+                for group in outer.param_groups
+                for parameter in group["params"]
+            }
+            self.assertNotIn(gap_id, inner_ids)
+            self.assertEqual(outer_ids, {gap_id})
+            self.assertTrue(
+                all(
+                    group["weight_decay"] == 0.0
+                    for group in outer.param_groups
+                )
+            )
+
+        parser = build_argument_parser()
+        holdout_args = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_confusion_gap_train_holdout",
+            ]
         )
-        outer = build_bilevel_angle_optimizer(model, 1e-3)
-        gap_id = id(model.circular_angle_learner.raw_gaps)
-        inner_ids = {
-            id(parameter)
-            for group in inner.param_groups
-            for parameter in group["params"]
-        }
-        outer_ids = {
-            id(parameter)
-            for group in outer.param_groups
-            for parameter in group["params"]
-        }
-        self.assertNotIn(gap_id, inner_ids)
-        self.assertEqual(outer_ids, {gap_id})
-        self.assertTrue(
-            all(group["weight_decay"] == 0.0 for group in outer.param_groups)
+        validate_arguments(holdout_args)
+        self.assertTrue(uses_bilevel_gap_learning(holdout_args))
+        self.assertFalse(
+            uses_validation_gap_learning(holdout_args)
+        )
+        self.assertEqual(
+            bilevel_outer_split_name(holdout_args),
+            "angle_holdout",
         )
 
     def test_validation_hypergradient_updates_only_bounded_gap(self):
@@ -1491,6 +1523,75 @@ class LearnableCircularAnglesTest(unittest.TestCase):
         self.assertIsNotNone(gradient)
         self.assertTrue(torch.isfinite(gradient).all())
         self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_three_pair_mode_adds_sad_neutral_gap_only(self):
+        mode = (
+            "sdt_cse_learnable_angles_confusion_gap_sad_neutral"
+        )
+        self.assertIn(mode, THREE_PAIR_CONFUSION_GAP_MODES)
+        self.assertEqual(
+            confusion_gap_pairs_for_mode(mode),
+            IEMOCAP_THREE_CONFUSION_GAP_PAIRS,
+        )
+        prior = build_iemocap_angles(geometry="equal")
+        model = make_model(mode, initial_class_angles=prior)
+        inputs = make_inputs()
+        outputs = model(*inputs)
+        labels = torch.tensor([[0, 1, 2, 3], [4, 5, 0, 0]])
+        losses = compute_sdt_cse_losses(
+            outputs,
+            labels,
+            inputs[3],
+            iemocap_class_weights(),
+            circular_loss_function=CircularCSELoss(
+                class_angles=prior
+            ),
+            circular_weight=0.1,
+            angle_weight=0.1,
+            confusion_gap_weight=0.1,
+            minimum_confusion_gap_degrees=75.0,
+            confusion_gap_pairs=confusion_gap_pairs_for_mode(mode),
+        )
+        expected_penalty = 3.0 * math.radians(15.0) ** 2
+        self.assertAlmostEqual(
+            float(losses["confusion_gap_regularization"]),
+            expected_penalty,
+            places=5,
+        )
+        history = angle_history_row(
+            1,
+            model,
+            prior,
+            minimum_confusion_gap_degrees=75.0,
+        )
+        for pair_name in (
+            "happy_excited",
+            "angry_frustrated",
+            "sad_neutral",
+        ):
+            self.assertAlmostEqual(
+                history[
+                    "confusion_gap_{}_degrees".format(pair_name)
+                ],
+                60.0,
+                places=4,
+            )
+
+        parser = build_argument_parser()
+        args = parser.parse_args(["--experiment-mode", mode])
+        validate_arguments(args)
+        self.assertEqual(args.circular_geometry, "equal")
+        self.assertEqual(args.confusion_gap_weight, 0.1)
+        invalid = parser.parse_args(
+            [
+                "--experiment-mode",
+                mode,
+                "--minimum-confusion-gap-degrees",
+                "120",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid)
 
     def test_confusion_gap_gradient_increases_selected_gaps(self):
         learner = LearnableCircularAngles(

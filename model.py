@@ -15,9 +15,11 @@ EXPERIMENT_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_learnable_angles_confusion_gap_sad_neutral",
     "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
     "sdt_cse_confusion_margin",
     "sdt_cse_bilevel_confusion_gap",
+    "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
 )
@@ -40,9 +42,11 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_fusion_only",
     "sdt_cse_learnable_angles",
     "sdt_cse_learnable_angles_confusion_gap",
+    "sdt_cse_learnable_angles_confusion_gap_sad_neutral",
     "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
     "sdt_cse_confusion_margin",
     "sdt_cse_bilevel_confusion_gap",
+    "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
 )
@@ -52,19 +56,28 @@ ALL_COSINE_MODES = (
 )
 ALL_MODAL_CSE_MODES = ("sdt_cse_all_modal_cse",)
 FUSION_ONLY_MODES = ("sdt_cse_fusion_only",)
+THREE_PAIR_CONFUSION_GAP_MODES = (
+    "sdt_cse_learnable_angles_confusion_gap_sad_neutral",
+)
 CONFUSION_GAP_MODES = (
     "sdt_cse_learnable_angles_confusion_gap",
+    *THREE_PAIR_CONFUSION_GAP_MODES,
     "sdt_cse_learnable_angles_confusion_gap_hypo_aligned",
 )
 CONFUSION_MARGIN_MODES = (
     "sdt_cse_confusion_margin",
     "sdt_cse_bilevel_confusion_gap",
+    "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
 )
 BILEVEL_SHARED_GAP_MODES = (
     "sdt_cse_bilevel_confusion_gap",
+    "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
+)
+TRAIN_HOLDOUT_BILEVEL_MODES = (
+    "sdt_cse_bilevel_confusion_gap_train_holdout",
 )
 BILEVEL_ALL_GAP_MODES = ("sdt_cse_bilevel_all_gaps",)
 BILEVEL_ANGLE_MODES = (
