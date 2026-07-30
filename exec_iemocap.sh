@@ -18,7 +18,8 @@ for mode in \
   sdt_cse_learnable_angles_confusion_gap_sad_neutral \
   sdt_cse_learnable_angles_confusion_gap_hypo_aligned \
   sdt_cse_confusion_margin \
-  sdt_cse_bilevel_confusion_gap_train_holdout
+  sdt_cse_bilevel_confusion_gap_train_holdout \
+  sdt_cse_bilevel_all_gaps_train_holdout
 do
   for seed in $(seq 2024 2033)
   do

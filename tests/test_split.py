@@ -354,6 +354,52 @@ class FixedSplitTest(unittest.TestCase):
                 "clsweight_0.1_anglelr_0.001_outerconf_0.1"
             ),
         )
+        all_gap_holdout_condition = experiment_directory_name(
+            "sdt_cse_bilevel_all_gaps_train_holdout",
+            0.1,
+            "equal",
+            confused_cse_pair_weight=5.0,
+            confusion_classification_margin=0.1,
+            confusion_classification_weight=0.1,
+            bilevel_angle_learning_rate=0.001,
+            bilevel_outer_confusion_weight=0.1,
+            bilevel_all_gaps_initialization="equal",
+            bilevel_minimum_class_gap_degrees=20.0,
+            bilevel_gap_prior_weight=0.01,
+            angle_holdout_ratio=0.1,
+        )
+        self.assertEqual(
+            all_gap_holdout_condition,
+            (
+                "sdt_cse_bilevel_all_gaps_train_holdout_l0.1_"
+                "iequal_mg20_pr0.01_p5_cm0.1_cw0.1_alr0.001_"
+                "oc0.1_ah0.1"
+            ),
+        )
+        self.assertEqual(
+            condition_name(
+                {
+                    "experiment_mode": (
+                        "sdt_cse_bilevel_all_gaps_train_holdout"
+                    ),
+                    "circular_weight": 0.1,
+                    "selection_protocol": "validation",
+                    "confused_cse_pair_weight": 5.0,
+                    "confusion_classification_margin": 0.1,
+                    "confusion_classification_weight": 0.1,
+                    "angle_holdout_ratio": 0.1,
+                    "bilevel_geometry": {
+                        "initialization": "equal",
+                        "minimum_class_gap_degrees": 20.0,
+                        "gap_prior_weight": 0.01,
+                        "angle_learning_rate": 0.001,
+                        "outer_confusion_weight": 0.1,
+                        "angle_holdout_ratio": 0.1,
+                    },
+                }
+            ),
+            all_gap_holdout_condition,
+        )
         self.assertEqual(
             experiment_directory_name(
                 "sdt_cse_bilevel_all_gaps",
@@ -564,6 +610,41 @@ class FixedSplitTest(unittest.TestCase):
             all_gaps.all_gap_learning_source, "validation"
         )
 
+        all_gaps_holdout = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps_train_holdout",
+            ]
+        )
+        validate_arguments(all_gaps_holdout)
+        self.assertEqual(
+            all_gaps_holdout.circular_geometry, "equal"
+        )
+        self.assertEqual(
+            all_gaps_holdout.angle_holdout_ratio, 0.1
+        )
+        self.assertFalse(
+            uses_validation_gap_learning(all_gaps_holdout)
+        )
+        self.assertTrue(
+            uses_bilevel_gap_learning(all_gaps_holdout)
+        )
+        self.assertEqual(
+            bilevel_outer_split_name(all_gaps_holdout),
+            "angle_holdout",
+        )
+
+        invalid_all_gaps_holdout_source = parser.parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps_train_holdout",
+                "--all-gap-learning-source",
+                "training",
+            ]
+        )
+        with self.assertRaises(ValueError):
+            validate_arguments(invalid_all_gaps_holdout_source)
+
         nrc_all_gaps = parser.parse_args(
             [
                 "--experiment-mode",
@@ -744,6 +825,28 @@ class FixedSplitTest(unittest.TestCase):
                 "sdt_cse_bilevel_all_gaps_lambda_0.1_init_equal_"
                 "mingap_20_prior_0.01_pair_5_clsmargin_0.1_"
                 "clsweight_0.1_anglelr_0.001_outerconf_0.1"
+            ),
+        )
+        all_gaps_holdout = dict(all_gaps)
+        all_gaps_holdout.update(
+            {
+                "experiment_mode": (
+                    "sdt_cse_bilevel_all_gaps_train_holdout"
+                ),
+                "angle_holdout_ratio": 0.1,
+                "bilevel_geometry": dict(
+                    all_gaps["bilevel_geometry"],
+                    learning_source="angle_holdout",
+                    angle_holdout_ratio=0.1,
+                ),
+            }
+        )
+        self.assertEqual(
+            condition_name(all_gaps_holdout),
+            (
+                "sdt_cse_bilevel_all_gaps_train_holdout_l0.1_"
+                "iequal_mg20_pr0.01_p5_cm0.1_cw0.1_alr0.001_"
+                "oc0.1_ah0.1"
             ),
         )
         training_all_gaps = dict(all_gaps)

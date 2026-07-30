@@ -113,6 +113,7 @@ class ModelModeTest(unittest.TestCase):
             "sdt_cse_bilevel_confusion_gap",
             "sdt_cse_bilevel_confusion_gap_train_holdout",
             "sdt_cse_bilevel_all_gaps",
+            "sdt_cse_bilevel_all_gaps_train_holdout",
         ):
             model = make_model(mode).eval()
             with torch.no_grad():
@@ -224,6 +225,7 @@ class ModelModeTest(unittest.TestCase):
                 "sdt_cse_bilevel_confusion_gap",
                 "sdt_cse_bilevel_confusion_gap_train_holdout",
                 "sdt_cse_bilevel_all_gaps",
+                "sdt_cse_bilevel_all_gaps_train_holdout",
             ):
                 self.assertIsNotNone(model.circular_angle_learner)
                 self.assertEqual(outputs["class_angles"].shape, (6,))
@@ -246,6 +248,7 @@ class ModelModeTest(unittest.TestCase):
                     "sdt_cse_bilevel_confusion_gap",
                     "sdt_cse_bilevel_confusion_gap_train_holdout",
                     "sdt_cse_bilevel_all_gaps",
+                    "sdt_cse_bilevel_all_gaps_train_holdout",
                 ),
             )
 
@@ -1093,33 +1096,50 @@ class BilevelAllGapsTest(unittest.TestCase):
         )
 
     def test_all_gap_optimizer_is_outer_only_and_vector_valued(self):
-        model = make_model("sdt_cse_bilevel_all_gaps")
-        inner = build_optimizer(
-            model,
-            1e-4,
-            1e-5,
-            exclude_angle_parameters=True,
-        )
-        outer = build_bilevel_angle_optimizer(model, 1e-3)
-        raw = model.circular_angle_learner.raw_gaps
-        self.assertEqual(tuple(raw.shape), (6,))
-        inner_ids = {
-            id(parameter)
-            for group in inner.param_groups
-            for parameter in group["params"]
-        }
-        outer_parameters = [
-            parameter
-            for group in outer.param_groups
-            for parameter in group["params"]
-        ]
-        self.assertNotIn(id(raw), inner_ids)
-        self.assertEqual(outer_parameters, [raw])
-        self.assertTrue(
-            all(
-                group["weight_decay"] == 0.0
-                for group in outer.param_groups
+        for mode in (
+            "sdt_cse_bilevel_all_gaps",
+            "sdt_cse_bilevel_all_gaps_train_holdout",
+        ):
+            model = make_model(mode)
+            inner = build_optimizer(
+                model,
+                1e-4,
+                1e-5,
+                exclude_angle_parameters=True,
             )
+            outer = build_bilevel_angle_optimizer(model, 1e-3)
+            raw = model.circular_angle_learner.raw_gaps
+            self.assertEqual(tuple(raw.shape), (6,))
+            inner_ids = {
+                id(parameter)
+                for group in inner.param_groups
+                for parameter in group["params"]
+            }
+            outer_parameters = [
+                parameter
+                for group in outer.param_groups
+                for parameter in group["params"]
+            ]
+            self.assertNotIn(id(raw), inner_ids)
+            self.assertEqual(outer_parameters, [raw])
+            self.assertTrue(
+                all(
+                    group["weight_decay"] == 0.0
+                    for group in outer.param_groups
+                )
+            )
+
+        args = build_argument_parser().parse_args(
+            [
+                "--experiment-mode",
+                "sdt_cse_bilevel_all_gaps_train_holdout",
+            ]
+        )
+        validate_arguments(args)
+        self.assertTrue(uses_bilevel_gap_learning(args))
+        self.assertFalse(uses_validation_gap_learning(args))
+        self.assertEqual(
+            bilevel_outer_split_name(args), "angle_holdout"
         )
 
     def test_validation_hypergradient_learns_six_constrained_gaps(self):

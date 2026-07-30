@@ -89,54 +89,56 @@ def condition_name(summary):
                 "g",
             ),
         )
-    elif mode == "sdt_cse_bilevel_all_gaps":
+    elif mode in (
+        "sdt_cse_bilevel_all_gaps",
+        "sdt_cse_bilevel_all_gaps_train_holdout",
+    ):
         geometry = summary.get("bilevel_geometry") or {}
-        condition = (
-            "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}"
-        ).format(
-            mode,
-            format(float(summary["circular_weight"]), "g"),
-            geometry.get("initialization", "equal"),
-            format(
-                float(
-                    geometry.get(
-                        "minimum_class_gap_degrees", 20.0
-                    )
+        if mode == "sdt_cse_bilevel_all_gaps_train_holdout":
+            condition = (
+                "{}_l{}_i{}_mg{}_pr{}_p{}_cm{}_cw{}_alr{}_oc{}_ah{}"
+            ).format(
+                mode,
+                format(float(summary["circular_weight"]), "g"),
+                geometry.get("initialization", "equal"),
+                format(
+                    float(
+                        geometry.get(
+                            "minimum_class_gap_degrees", 20.0
+                        )
+                    ),
+                    "g",
                 ),
-                "g",
-            ),
-            format(
-                float(geometry.get("gap_prior_weight", 0.01)),
-                "g",
-            ),
-            format(
-                float(summary.get("confused_cse_pair_weight", 5.0)),
-                "g",
-            ),
-            format(
-                float(
-                    summary.get(
-                        "confusion_classification_margin", 0.1
-                    )
+                format(
+                    float(
+                        geometry.get("gap_prior_weight", 0.01)
+                    ),
+                    "g",
                 ),
-                "g",
-            ),
-            format(
-                float(
-                    summary.get(
-                        "confusion_classification_weight", 0.1
-                    )
+                format(
+                    float(
+                        summary.get(
+                            "confused_cse_pair_weight", 5.0
+                        )
+                    ),
+                    "g",
                 ),
-                "g",
-            ),
-        )
-        learning_source = geometry.get(
-            "learning_source",
-            summary.get("all_gap_learning_source", "validation"),
-        )
-        if learning_source == "validation":
-            condition += "_anglelr_{}_outerconf_{}".format(
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_margin", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
                 format(
                     float(
                         geometry.get(
@@ -153,9 +155,90 @@ def condition_name(summary):
                     ),
                     "g",
                 ),
+                format(
+                    float(
+                        geometry.get(
+                            "angle_holdout_ratio",
+                            summary.get("angle_holdout_ratio", 0.1),
+                        )
+                    ),
+                    "g",
+                ),
             )
         else:
-            condition += "_source_{}".format(learning_source)
+            condition = (
+                "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
+                "clsmargin_{}_clsweight_{}"
+            ).format(
+                mode,
+                format(float(summary["circular_weight"]), "g"),
+                geometry.get("initialization", "equal"),
+                format(
+                    float(
+                        geometry.get(
+                            "minimum_class_gap_degrees", 20.0
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        geometry.get("gap_prior_weight", 0.01)
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confused_cse_pair_weight", 5.0
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_margin", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+                format(
+                    float(
+                        summary.get(
+                            "confusion_classification_weight", 0.1
+                        )
+                    ),
+                    "g",
+                ),
+            )
+            learning_source = geometry.get(
+                "learning_source",
+                summary.get(
+                    "all_gap_learning_source", "validation"
+                ),
+            )
+            if learning_source == "validation":
+                condition += "_anglelr_{}_outerconf_{}".format(
+                    format(
+                        float(
+                            geometry.get(
+                                "angle_learning_rate", 0.001
+                            )
+                        ),
+                        "g",
+                    ),
+                    format(
+                        float(
+                            geometry.get(
+                                "outer_confusion_weight", 0.1
+                            )
+                        ),
+                        "g",
+                    ),
+                )
+            else:
+                condition += "_source_{}".format(learning_source)
     elif mode == "sdt_cse_bilevel_confusion_gap_hypo_aligned":
         geometry = summary.get("bilevel_geometry") or {}
         condition = (

@@ -22,6 +22,7 @@ EXPERIMENT_MODES = (
     "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
+    "sdt_cse_bilevel_all_gaps_train_holdout",
 )
 PRIOR_FREE_HYPO_MODES = ("sdt_hypo",)
 HYPO_ALIGNMENT_MODES = (
@@ -49,6 +50,7 @@ CIRCULAR_CSE_MODES = (
     "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
+    "sdt_cse_bilevel_all_gaps_train_holdout",
 )
 ALL_COSINE_MODES = (
     "sdt_cse_all_cosine",
@@ -70,6 +72,7 @@ CONFUSION_MARGIN_MODES = (
     "sdt_cse_bilevel_confusion_gap_train_holdout",
     "sdt_cse_bilevel_confusion_gap_hypo_aligned",
     "sdt_cse_bilevel_all_gaps",
+    "sdt_cse_bilevel_all_gaps_train_holdout",
 )
 BILEVEL_SHARED_GAP_MODES = (
     "sdt_cse_bilevel_confusion_gap",
@@ -78,8 +81,12 @@ BILEVEL_SHARED_GAP_MODES = (
 )
 TRAIN_HOLDOUT_BILEVEL_MODES = (
     "sdt_cse_bilevel_confusion_gap_train_holdout",
+    "sdt_cse_bilevel_all_gaps_train_holdout",
 )
-BILEVEL_ALL_GAP_MODES = ("sdt_cse_bilevel_all_gaps",)
+BILEVEL_ALL_GAP_MODES = (
+    "sdt_cse_bilevel_all_gaps",
+    "sdt_cse_bilevel_all_gaps_train_holdout",
+)
 BILEVEL_ANGLE_MODES = (
     *BILEVEL_SHARED_GAP_MODES,
     *BILEVEL_ALL_GAP_MODES,

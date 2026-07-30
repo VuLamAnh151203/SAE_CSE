@@ -26,6 +26,7 @@ The existing `../SDT` implementation and data are not modified.
 | `sdt_cse_bilevel_confusion_gap_train_holdout` | Spherical projection + cosine | Original linear | Yes | Shared confusion gap learned from a dedicated 10% trainVid holdout |
 | `sdt_cse_bilevel_confusion_gap_hypo_aligned` | Spherical projection + cosine | Original linear | Yes | Bilevel circular gap + circle-aligned HYPO prototypes |
 | `sdt_cse_bilevel_all_gaps` | Spherical projection + cosine | Original linear | Yes | Six hard-floor ordered gaps learned from validation or training |
+| `sdt_cse_bilevel_all_gaps_train_holdout` | Spherical projection + cosine | Original linear | Yes | Six hard-floor ordered gaps learned from a dedicated 10% trainVid holdout |
 
 In `sdt_cse_all_cosine`, each final SDT text, audio, and visual
 representation is processed by an independent head with the same structure
@@ -83,6 +84,10 @@ The comparisons have distinct purposes:
 - `sdt_cse_bilevel_all_gaps - sdt_cse_bilevel_confusion_gap` removes the
   equal-confusion/equal-remaining-gap restriction and validation-learns all
   six consecutive gaps while preserving their circular order.
+- `sdt_cse_bilevel_all_gaps_train_holdout -
+  sdt_cse_bilevel_all_gaps` moves six-gap hypergradient learning from
+  validation to a dedicated trainVid holdout, reserving validation for
+  checkpoint selection.
 
 ## Internal spherical residuals
 
@@ -438,6 +443,22 @@ validation only selects the checkpoint. The gaps use the normal `--lr`;
 `--bilevel-hvp-radius`, `--bilevel-outer-confusion-weight`, and
 `--bilevel-angle-gradient-clip` are inactive.
 
+`sdt_cse_bilevel_all_gaps_train_holdout` keeps the same six-gap
+parameterization, outer fusion-CE plus confusion-margin objective, gap
+prior, and finite-difference hypergradient. It instead uses the same
+four-way protocol as the shared-gap train-holdout mode:
+
+```text
+80% trainVid -> model updates
+10% trainVid -> six-gap bilevel outer objective
+10% trainVid -> validation checkpoint selection only
+testVid      -> final evaluation only
+```
+
+The mode requires `--all-gap-learning-source validation`; in this mode that
+setting means bilevel optimization is enabled, while the actual outer split
+is recorded as `angle_holdout`.
+
 NRC-VAD initialization is also available with
 `--bilevel-all-gaps-initialization nrc_vad`, but its smallest prior gap is
 about 19.8 degrees. Therefore, set
@@ -751,6 +772,26 @@ python train.py \
   --device cuda \
   --gpu-id 0 \
   --seed 2024
+python train.py \
+  --experiment-mode sdt_cse_bilevel_all_gaps_train_holdout \
+  --selection-protocol validation \
+  --validation-ratio 0.1 \
+  --angle-holdout-ratio 0.1 \
+  --all-gap-learning-source validation \
+  --circular-weight 0.1 \
+  --confused-cse-pair-weight 5 \
+  --confusion-classification-margin 0.1 \
+  --confusion-classification-weight 0.1 \
+  --bilevel-all-gaps-initialization equal \
+  --bilevel-minimum-class-gap-degrees 20 \
+  --bilevel-gap-prior-weight 0.01 \
+  --bilevel-angle-learning-rate 0.001 \
+  --bilevel-inner-step-size 0.0001 \
+  --bilevel-hvp-radius 0.01 \
+  --bilevel-outer-confusion-weight 0.1 \
+  --device cuda \
+  --gpu-id 0 \
+  --seed 2024
 ```
 
 Run the same six-gap model while learning gaps only from training:
@@ -913,6 +954,15 @@ It starts from six equal 60-degree gaps, enforces a 20-degree minimum for
 each gap, and records all six learned values in `angle_history.csv`,
 `bilevel_gap_history.csv`, checkpoints, per-seed summaries, and aggregate
 CSV files.
+
+Run the train-holdout six-gap counterpart:
+
+```bash
+GPU_ID=0 bash exec_iemocap_bilevel_all_gaps_train_holdout.sh
+```
+
+This learns all six gaps from the dedicated 10% angle holdout and uses the
+separate 10% validation split only for checkpoint selection.
 
 The launcher defaults to validation gap learning. Run the training-only
 counterpart with:

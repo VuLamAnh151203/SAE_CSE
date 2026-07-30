@@ -206,6 +206,15 @@ def bilevel_outer_split_name(args):
     return None
 
 
+def effective_all_gap_learning_source(args):
+    if (
+        args.experiment_mode in BILEVEL_ALL_GAP_MODES
+        and args.experiment_mode in TRAIN_HOLDOUT_BILEVEL_MODES
+    ):
+        return "angle_holdout"
+    return args.all_gap_learning_source
+
+
 def confusion_gap_pairs_for_mode(experiment_mode):
     if experiment_mode in THREE_PAIR_CONFUSION_GAP_MODES:
         return IEMOCAP_THREE_CONFUSION_GAP_PAIRS
@@ -438,7 +447,11 @@ def _compute_batch_losses(
         gap_prior_regularization = (
             model.circular_angle_learner.gap_prior_regularization()
         )
-        if args.all_gap_learning_source == "training":
+        if (
+            args.all_gap_learning_source == "training"
+            and model.experiment_mode
+            not in TRAIN_HOLDOUT_BILEVEL_MODES
+        ):
             losses["total_loss"] = (
                 losses["total_loss"]
                 + args.bilevel_gap_prior_weight
@@ -1390,30 +1403,61 @@ def experiment_directory_name(
             format(float(hypo_prototype_momentum), "g"),
         )
     elif mode in BILEVEL_ALL_GAP_MODES:
-        condition = (
-            "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
-            "clsmargin_{}_clsweight_{}"
-        ).format(
-            mode,
-            format(float(circular_weight), "g"),
-            bilevel_all_gaps_initialization,
-            format(
-                float(bilevel_minimum_class_gap_degrees), "g"
-            ),
-            format(float(bilevel_gap_prior_weight), "g"),
-            format(float(confused_cse_pair_weight), "g"),
-            format(float(confusion_classification_margin), "g"),
-            format(float(confusion_classification_weight), "g"),
-        )
-        if all_gap_learning_source == "validation":
-            condition += "_anglelr_{}_outerconf_{}".format(
+        if mode in TRAIN_HOLDOUT_BILEVEL_MODES:
+            condition = (
+                "{}_l{}_i{}_mg{}_pr{}_p{}_cm{}_cw{}_alr{}_oc{}_ah{}"
+            ).format(
+                mode,
+                format(float(circular_weight), "g"),
+                bilevel_all_gaps_initialization,
+                format(
+                    float(bilevel_minimum_class_gap_degrees), "g"
+                ),
+                format(float(bilevel_gap_prior_weight), "g"),
+                format(float(confused_cse_pair_weight), "g"),
+                format(
+                    float(confusion_classification_margin), "g"
+                ),
+                format(
+                    float(confusion_classification_weight), "g"
+                ),
                 format(float(bilevel_angle_learning_rate), "g"),
                 format(float(bilevel_outer_confusion_weight), "g"),
+                format(float(angle_holdout_ratio), "g"),
             )
         else:
-            condition += "_source_{}".format(
-                all_gap_learning_source
+            condition = (
+                "{}_lambda_{}_init_{}_mingap_{}_prior_{}_pair_{}_"
+                "clsmargin_{}_clsweight_{}"
+            ).format(
+                mode,
+                format(float(circular_weight), "g"),
+                bilevel_all_gaps_initialization,
+                format(
+                    float(bilevel_minimum_class_gap_degrees), "g"
+                ),
+                format(float(bilevel_gap_prior_weight), "g"),
+                format(float(confused_cse_pair_weight), "g"),
+                format(
+                    float(confusion_classification_margin), "g"
+                ),
+                format(
+                    float(confusion_classification_weight), "g"
+                ),
             )
+            if all_gap_learning_source == "validation":
+                condition += "_anglelr_{}_outerconf_{}".format(
+                    format(
+                        float(bilevel_angle_learning_rate), "g"
+                    ),
+                    format(
+                        float(bilevel_outer_confusion_weight), "g"
+                    ),
+                )
+            else:
+                condition += "_source_{}".format(
+                    all_gap_learning_source
+                )
     elif mode in BILEVEL_SHARED_GAP_MODES:
         if mode in TRAIN_HOLDOUT_BILEVEL_MODES:
             condition = (
@@ -1698,7 +1742,12 @@ def bilevel_gap_payload(model, args):
             .cpu()
             .item()
         )
-        if args.all_gap_learning_source == "training":
+        training_source = (
+            args.all_gap_learning_source == "training"
+            and model.experiment_mode
+            not in TRAIN_HOLDOUT_BILEVEL_MODES
+        )
+        if training_source:
             optimization = {
                 "optimizer": "main_adam_zero_weight_decay",
                 "angle_learning_rate": float(args.lr),
@@ -1728,7 +1777,15 @@ def bilevel_gap_payload(model, args):
             "parameterization": (
                 "minimum_floor_plus_softmax_all_gap_allocation"
             ),
-            "learning_source": args.all_gap_learning_source,
+            "learning_source": effective_all_gap_learning_source(
+                args
+            ),
+            "angle_holdout_ratio": (
+                float(args.angle_holdout_ratio)
+                if model.experiment_mode
+                in TRAIN_HOLDOUT_BILEVEL_MODES
+                else None
+            ),
             "initialization": (
                 args.bilevel_all_gaps_initialization
             ),
@@ -1995,7 +2052,7 @@ def save_checkpoint(
             args.bilevel_gap_prior_weight
         ),
         "all_gap_learning_source": (
-            args.all_gap_learning_source
+            effective_all_gap_learning_source(args)
         ),
         "bilevel_angle_learning_rate": (
             args.bilevel_angle_learning_rate
@@ -2131,7 +2188,7 @@ def validate_arguments(args):
     ):
         raise ValueError(
             "--all-gap-learning-source applies only to "
-            "sdt_cse_bilevel_all_gaps"
+            "the bilevel all-gap modes"
         )
     if args.selection_protocol not in SELECTION_PROTOCOLS:
         raise ValueError(
@@ -2173,10 +2230,19 @@ def validate_arguments(args):
                 "train-holdout bilevel mode requires validation-only "
                 "checkpoint selection"
             )
+        if (
+            args.experiment_mode in BILEVEL_ALL_GAP_MODES
+            and args.all_gap_learning_source != "validation"
+        ):
+            raise ValueError(
+                "the all-gap train-holdout mode learns gaps from "
+                "angle_holdout and does not support "
+                "--all-gap-learning-source training"
+            )
     elif args.angle_holdout_ratio != 0.0:
         raise ValueError(
-            "--angle-holdout-ratio applies only to "
-            "sdt_cse_bilevel_confusion_gap_train_holdout"
+            "--angle-holdout-ratio applies only to train-holdout "
+            "bilevel modes"
         )
     if args.sdt_residual_update not in SDT_RESIDUAL_UPDATES:
         raise ValueError(
@@ -3208,7 +3274,7 @@ def train_and_test(args):
         ),
         "circular_weight": args.circular_weight,
         "all_gap_learning_source": (
-            args.all_gap_learning_source
+            effective_all_gap_learning_source(args)
         ),
         "angle_weight": args.angle_weight,
         "confusion_gap_weight": args.confusion_gap_weight,
@@ -3481,7 +3547,9 @@ def build_argument_parser():
         help=(
             "validation uses bilevel hypergradients; training puts "
             "the same six hard-floor gap parameters in the ordinary "
-            "training optimizer"
+            "training optimizer. The all-gap train-holdout mode "
+            "requires validation here and redirects the bilevel "
+            "outer objective to angle_holdout"
         ),
     )
     parser.add_argument(
@@ -3574,7 +3642,7 @@ def build_argument_parser():
         help=(
             "fraction of trainVid reserved exclusively for bilevel "
             "angle selection; defaults to 0.1 in the train-holdout "
-            "mode and 0 otherwise"
+            "modes and 0 otherwise"
         ),
     )
     parser.add_argument(
